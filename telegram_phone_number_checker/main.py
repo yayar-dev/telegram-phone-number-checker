@@ -138,6 +138,66 @@ async def get_names(
     return result
 
 
+async def get_names_batch(client: TelegramClient, phone_numbers: list[str]) -> dict[str, dict]:
+    """Check a small phone-number batch with one contacts.importContacts request."""
+    contacts = [
+        types.InputPhoneContact(
+            client_id=index,
+            phone=phone_number,
+            first_name="",
+            last_name="",
+        )
+        for index, phone_number in enumerate(phone_numbers, start=1)
+    ]
+    imported_contacts = await client(functions.contacts.ImportContactsRequest(contacts))
+    imported_user_ids = {
+        contact.client_id: contact.user_id for contact in imported_contacts.imported
+    }
+    users_by_id = {user.id: user for user in imported_contacts.users}
+    retry_contact_ids = set(imported_contacts.retry_contacts)
+    results = {}
+    imported_user_ids_to_delete = []
+
+    for index, phone_number in enumerate(phone_numbers, start=1):
+        user_id = imported_user_ids.get(index)
+        user = users_by_id.get(user_id)
+        if user is None:
+            message = (
+                "Telegram asked to retry this contact later."
+                if index in retry_contact_ids
+                else "No response, the phone number is not on Telegram or has blocked contact adding."
+            )
+            results[phone_number] = {"error": message}
+            continue
+
+        imported_user_ids_to_delete.append(user_id)
+        results[phone_number] = {
+            "id": user.id,
+            "username": user.username,
+            "usernames": [u.username for u in (user.usernames or [])]
+            if user.usernames
+            else None,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "fake": user.fake,
+            "verified": user.verified,
+            "premium": user.premium,
+            "mutual_contact": user.mutual_contact,
+            "bot": user.bot,
+            "bot_chat_history": user.bot_chat_history,
+            "restricted": user.restricted,
+            "restriction_reason": user.restriction_reason,
+            "user_was_online": get_human_readable_user_status(user.status),
+            "phone": user.phone,
+        }
+
+    if imported_user_ids_to_delete:
+        await client(
+            functions.contacts.DeleteContactsRequest(id=imported_user_ids_to_delete)
+        )
+    return results
+
+
 async def get_user_by_username(
     client: TelegramClient, username: str, download_profile_photos: bool = False
 ) -> dict:

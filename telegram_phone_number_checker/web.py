@@ -27,6 +27,8 @@ ROW_FIELDS = (
     "telegram_link",
     "detail",
 )
+BATCH_SIZE = 20
+BATCH_PAUSE_SECONDS = 1
 
 
 class ConfigurationError(Exception):
@@ -77,12 +79,15 @@ async def _check_phone_batch(raw: str) -> list[dict[str, str]]:
         os.getenv("API_ID"), os.getenv("API_HASH"), os.getenv("PHONE_NUMBER")
     )
     try:
-        for phone in valid_phones:
+        for start in range(0, len(valid_phones), BATCH_SIZE):
+            phones = valid_phones[start : start + BATCH_SIZE]
             try:
-                result = await upstream.get_names(client, phone)
-                rows.append(map_lookup_result(phone, result))
-            except Exception as error:  # Telegram failures are reported per number.
-                rows.append(
+                results = await upstream.get_names_batch(client, phones)
+                rows.extend(
+                    map_lookup_result(phone, results[phone]) for phone in phones
+                )
+            except Exception as error:  # Telegram failures are reported per batch.
+                rows.extend(
                     {
                         "phone": phone,
                         "status": "ERROR",
@@ -92,7 +97,10 @@ async def _check_phone_batch(raw: str) -> list[dict[str, str]]:
                         "telegram_link": "",
                         "detail": str(error),
                     }
+                    for phone in phones
                 )
+            if start + BATCH_SIZE < len(valid_phones):
+                await asyncio.sleep(BATCH_PAUSE_SECONDS)
     finally:
         disconnected = client.disconnect()
         if inspect.isawaitable(disconnected):

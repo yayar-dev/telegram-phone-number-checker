@@ -1,6 +1,7 @@
 from http.client import HTTPConnection
 from threading import Thread
 from urllib.parse import urlencode
+import asyncio
 
 from telegram_phone_number_checker import web
 
@@ -8,6 +9,35 @@ from telegram_phone_number_checker import web
 def test_reads_custom_port_from_environment(monkeypatch):
     monkeypatch.setenv("TELEGRAM_VALIDATOR_PORT", "8010")
     assert web.get_port() == 8010
+
+
+def test_web_uses_one_batch_lookup_for_valid_phone_numbers(monkeypatch):
+    batch_calls = []
+
+    class Client:
+        async def disconnect(self):
+            return None
+
+    async def login(*args):
+        return Client()
+
+    async def get_names_batch(client, phones):
+        batch_calls.append(phones)
+        return {phone: {"error": "No response, the phone number is not on Telegram."} for phone in phones}
+
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
+    monkeypatch.setattr(web.upstream, "login", login)
+    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch, raising=False)
+
+    rows = asyncio.run(web._check_phone_batch("+79991234567\n+79990000000"))
+
+    assert batch_calls == [["+79991234567", "+79990000000"]]
+    assert [row["status"] for row in rows] == [
+        "NOT_FOUND_OR_PRIVACY_RESTRICTED",
+        "NOT_FOUND_OR_PRIVACY_RESTRICTED",
+    ]
 
 
 def test_csv_neutralizes_spreadsheet_formula_cells():
