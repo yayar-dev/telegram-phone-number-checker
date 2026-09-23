@@ -245,7 +245,10 @@ def test_csv_neutralizes_spreadsheet_formula_cells():
 
 
 def test_web_queues_job_and_keeps_browser_responsive():
+    calls = []
+
     def check_batch(raw: str):
+        calls.append(raw)
         time.sleep(0.05)
         return [
             {
@@ -278,6 +281,17 @@ def test_web_queues_job_and_keeps_browser_responsive():
         assert response.status == 303
         job_url = response.getheader("Location")
         assert job_url.startswith("/jobs/")
+        assert calls == []
+
+        connection.request("GET", job_url)
+        response = connection.getresponse()
+        page = response.read().decode()
+        assert "Запустить обработку" in page
+
+        connection.request("POST", f"{job_url}/start")
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 303
 
         for _ in range(20):
             connection.request("GET", job_url)
@@ -293,6 +307,30 @@ def test_web_queues_job_and_keeps_browser_responsive():
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_web_can_stop_deferred_contacts_without_dropping_them(monkeypatch):
+    class Client:
+        async def disconnect(self):
+            return None
+
+    async def login(*args):
+        return Client()
+
+    async def get_names_batch(client, phones):
+        return {phones[0]: {"retry": True, "error": "Retry later"}}
+
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
+    monkeypatch.setattr(web.upstream, "login", login)
+    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch, raising=False)
+
+    rows = asyncio.run(
+        web._check_phone_batch("+79991234567", skip_deferred=lambda: True)
+    )
+
+    assert rows[0]["status"] == "DEFERRED_NOT_CHECKED"
 
 
 def test_web_does_not_queue_without_explicit_confirmation():
@@ -375,6 +413,10 @@ def test_web_form_renders_results_and_downloads_csv():
         response.read()
         assert response.status == 303
         job_url = response.getheader("Location")
+        connection.request("POST", f"{job_url}/start")
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 303
         for _ in range(20):
             connection.request("GET", job_url)
             response = connection.getresponse()
@@ -419,6 +461,10 @@ def test_web_form_shows_configuration_problem_without_calling_telegram():
         response.read()
         assert response.status == 303
         job_url = response.getheader("Location")
+        connection.request("POST", f"{job_url}/start")
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 303
         for _ in range(20):
             connection.request("GET", job_url)
             response = connection.getresponse()
@@ -455,6 +501,10 @@ def test_web_form_shows_authorization_problem_instead_of_dropping_response():
         response.read()
         assert response.status == 303
         job_url = response.getheader("Location")
+        connection.request("POST", f"{job_url}/start")
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 303
         for _ in range(20):
             connection.request("GET", job_url)
             response = connection.getresponse()

@@ -63,7 +63,10 @@ def rows_to_csv(rows: list[dict[str, str]]) -> str:
 
 
 async def _check_phone_batch(
-    raw: str, progress: Callable[[int, int, str], None] | None = None
+    raw: str,
+    progress: Callable[[int, int, str], None] | None = None,
+    skip_deferred: Callable[[], bool] | None = None,
+    deferred: Callable[[list[str]], None] | None = None,
 ) -> list[dict[str, str]]:
     missing = [name for name in ("API_ID", "API_HASH", "PHONE_NUMBER") if not os.getenv(name)]
     if missing:
@@ -78,6 +81,13 @@ async def _check_phone_batch(
     def report(processed: int, message: str) -> None:
         if progress:
             progress(processed, len(entries), message)
+
+    def report_deferred(active_phones: list[str] | None = None) -> None:
+        if deferred:
+            deferred(
+                (active_phones or [])
+                + [phone for batch, _ in deferred_batches for phone in batch]
+            )
 
     report(0, "Задача принята. Подготавливаем проверку.")
 
@@ -95,7 +105,31 @@ async def _check_phone_batch(
                 if pending_batches:
                     phones, retry_attempt = pending_batches.popleft()
                 else:
+                    if skip_deferred and skip_deferred():
+                        for deferred_phones, _ in deferred_batches:
+                            results_by_phone.update(
+                                {
+                                    phone: {
+                                        "skipped": True,
+                                        "error": "Проверка отложена пользователем.",
+                                    }
+                                    for phone in deferred_phones
+                                }
+                            )
+                        deferred_batches.clear()
+                        report_deferred()
+                        report(
+                            sum(
+                                1
+                                for entry in entries
+                                if entry["phone"] in results_by_phone
+                                or not is_valid_phone(entry["phone"])
+                            ),
+                            "Отложенные контакты сняты с обработки.",
+                        )
+                        break
                     phones, retry_attempt = deferred_batches.popleft()
+                    report_deferred(phones)
                     wait_seconds = min(
                         RETRY_CONTACT_PAUSE_SECONDS * 2 ** (retry_attempt - 1),
                         MAX_RETRY_CONTACT_PAUSE_SECONDS,
@@ -125,6 +159,7 @@ async def _check_phone_batch(
                         )
                         if retry_phones:
                             deferred_batches.append((retry_phones, retry_attempt + 1))
+                            report_deferred()
                             report(
                                 sum(
                                     1
@@ -150,6 +185,7 @@ async def _check_phone_batch(
                     except Exception as error:  # Other Telegram failures are reported per batch.
                         results_by_phone.update({phone: {"error": str(error)} for phone in phones})
                         break
+                report_deferred()
                 report(
                     sum(
                         1
@@ -211,10 +247,28 @@ def render_page(
             rows = job["rows"]
             error = job["error"]
             download_url = f"/download.csv?job={job['id']}"
+        elif not job.get("started", False):
+            job_html = (
+                f"<p>В очереди: 0 из {job['total']}. Список сохранён и готов к проверке.</p>"
+                f'<form method="post" action="/jobs/{job["id"]}/start">'
+                '<button type="submit">Запустить обработку</button></form>'
+            )
         else:
+            deferred_html = ""
+            if job.get("deferred_phones", []):
+                phones = "".join(
+                    f"<li>{html.escape(phone)}</li>" for phone in job["deferred_phones"]
+                )
+                deferred_html = (
+                    f"<details><summary>Отложено к повтору: {len(job['deferred_phones'])}</summary>"
+                    f"<ul>{phones}</ul></details>"
+                )
             job_html = (
                 f"<p>В очереди и обработке: {job['processed']} из {job['total']}.</p>"
                 f"<p class=\"hint\">{html.escape(job['message'])}</p>"
+                f"{deferred_html}"
+                f'<form method="post" action="/jobs/{job["id"]}/stop-deferred">'
+                '<button type="submit">Не проверять отложенные</button></form>'
             )
             refresh_html = '<meta http-equiv="refresh" content="2">'
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
@@ -268,9 +322,32 @@ class ValidatorApplication:
                 "rows": [],
                 "error": "",
                 "complete": False,
+                "started": False,
+                "skip_deferred": False,
+                "deferred_phones": [],
             }
-        Thread(target=self._run_job, args=(job_id, raw), daemon=True).start()
         return job_id
+
+    def start(self, job_id: str) -> bool:
+        with self._state_lock:
+            job = self.jobs.get(job_id)
+            if not job or job["complete"] or job["started"]:
+                return False
+            job.update(started=True, message="Задача ожидает свободный аккаунт Telegram.")
+            raw = job["raw"]
+        Thread(target=self._run_job, args=(job_id, raw), daemon=True).start()
+        return True
+
+    def stop_deferred(self, job_id: str) -> bool:
+        with self._state_lock:
+            job = self.jobs.get(job_id)
+            if not job or job["complete"]:
+                return False
+            job.update(
+                skip_deferred=True,
+                message="Отложенные контакты будут сняты с обработки после текущего пакета.",
+            )
+        return True
 
     def snapshot(self, job_id: str) -> dict | None:
         with self._state_lock:
@@ -284,6 +361,10 @@ class ValidatorApplication:
     def _run_job(self, job_id: str, raw: str) -> None:
         with self._worker_lock:
             self._update_job(job_id, message="Проверка запущена.")
+            def skip_deferred() -> bool:
+                with self._state_lock:
+                    return self.jobs[job_id]["skip_deferred"]
+
             try:
                 if self.check_batch is check_phone_batch:
                     rows = asyncio.run(
@@ -291,6 +372,10 @@ class ValidatorApplication:
                             raw,
                             progress=lambda processed, total, message: self._update_job(
                                 job_id, processed=processed, total=total, message=message
+                            ),
+                            skip_deferred=skip_deferred,
+                            deferred=lambda phones: self._update_job(
+                                job_id, deferred_phones=phones
                             ),
                         )
                     )
@@ -352,20 +437,32 @@ class ValidatorApplication:
                 self.send_content(render_page(application.last_rows))
 
             def do_POST(self):
-                if urlparse(self.path).path != "/check":
+                path = urlparse(self.path).path
+                if path == "/check":
+                    length = int(self.headers.get("Content-Length", "0"))
+                    values = parse_qs(self.rfile.read(length).decode("utf-8"))
+                    phone_numbers = values.get("phone_numbers", [""])[0]
+                    if values.get("queue_confirmation", [""])[0] != "yes":
+                        self.send_content(
+                            render_page(
+                                error="Нажмите «Поставить в очередь», чтобы сохранить список."
+                            )
+                        )
+                        return
+                    self.send_redirect(f"/jobs/{application.enqueue(phone_numbers)}")
+                    return
+                job_path = path.removeprefix("/jobs/").split("/")
+                if len(job_path) != 2 or not job_path[0]:
                     self.send_error(404)
                     return
-                length = int(self.headers.get("Content-Length", "0"))
-                values = parse_qs(self.rfile.read(length).decode("utf-8"))
-                phone_numbers = values.get("phone_numbers", [""])[0]
-                if values.get("queue_confirmation", [""])[0] != "yes":
-                    self.send_content(
-                        render_page(
-                            error="Нажмите «Поставить в очередь», чтобы начать проверку."
-                        )
-                    )
+                job_id, action = job_path
+                if action == "start" and application.start(job_id):
+                    self.send_redirect(f"/jobs/{job_id}")
                     return
-                self.send_redirect(f"/jobs/{application.enqueue(phone_numbers)}")
+                if action == "stop-deferred" and application.stop_deferred(job_id):
+                    self.send_redirect(f"/jobs/{job_id}")
+                    return
+                self.send_error(404)
 
             def log_message(self, format: str, *args):
                 return

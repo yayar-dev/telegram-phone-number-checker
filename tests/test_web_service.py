@@ -89,3 +89,9 @@ def test_maps_no_contact_response_as_privacy_limited():
         "+79991234567",
         {"error": "No response, the phone number is not on Telegram or has blocked contact adding."},
     )["status"] == "NOT_FOUND_OR_PRIVACY_RESTRICTED"
+
+
+def test_maps_stopped_deferred_contact_without_claiming_a_result():
+    assert map_lookup_result(
+        "+79991234567", {"skipped": True, "error": "Проверка отложена пользователем."}
+    )["status"] == "DEFERRED_NOT_CHECKED"

@@ -74,9 +74,13 @@ def map_lookup_result(phone: str, result: dict) -> dict[str, str]:
     error = result.get("error")
     if error:
         status = (
-            "NOT_FOUND_OR_PRIVACY_RESTRICTED"
-            if error.startswith("No response")
-            else "ERROR"
+            "DEFERRED_NOT_CHECKED"
+            if result.get("skipped")
+            else (
+                "NOT_FOUND_OR_PRIVACY_RESTRICTED"
+                if error.startswith("No response")
+                else "ERROR"
+            )
         )
         return {
             "phone": phone,
