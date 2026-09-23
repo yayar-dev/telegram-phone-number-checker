@@ -289,6 +289,23 @@ def test_web_does_not_queue_without_explicit_confirmation():
         thread.join()
 
 
+def test_job_page_keeps_the_submitted_input_visible():
+    page = web.render_page(
+        job={
+            "id": "job-1",
+            "raw": 'ООО Тест\n+7 (999) 123-45-67',
+            "total": 1,
+            "processed": 0,
+            "message": "Задача поставлена в очередь.",
+            "rows": [],
+            "error": "",
+            "complete": False,
+        }
+    )
+
+    assert 'ООО Тест\n+7 (999) 123-45-67' in page
+
+
 def test_web_form_renders_results_and_downloads_csv():
     def check_batch(raw: str):
         assert raw == "+79991234567"

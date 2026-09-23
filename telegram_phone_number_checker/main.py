@@ -391,7 +391,11 @@ async def login(
     )
     PROXY = proxy or os.getenv("PROXY")
     client = TelegramClient(
-        PHONE_NUMBER, API_ID, API_HASH, proxy=parse_proxy(PROXY) if PROXY else None
+        PHONE_NUMBER,
+        API_ID,
+        API_HASH,
+        proxy=parse_proxy(PROXY) if PROXY else None,
+        flood_sleep_threshold=0,
     )
     await client.connect()
     if not await client.is_user_authorized():
