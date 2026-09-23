@@ -37,6 +37,10 @@ def parse_company_phone_batch(raw: str) -> list[dict[str, str]]:
             company_name = header.group("company_name")
             company_link = header.group("company_link")
             continue
+        if not stripped.startswith("+") and any(character.isalpha() for character in stripped):
+            company_name = stripped
+            company_link = ""
+            continue
         phone = normalize_phone_line(stripped)
         key = (company_name, company_link, phone)
         if key not in seen:

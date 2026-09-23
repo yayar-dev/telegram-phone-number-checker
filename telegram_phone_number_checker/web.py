@@ -7,8 +7,12 @@ import inspect
 import io
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock, Thread
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
+
+from telethon.errors import FloodWaitError
 
 from telegram_phone_number_checker import main as upstream
 from telegram_phone_number_checker.web_service import (
@@ -31,6 +35,7 @@ ROW_FIELDS = (
 )
 BATCH_SIZE = 10
 BATCH_PAUSE_SECONDS = 1
+RETRY_CONTACT_PAUSE_SECONDS = 30
 
 
 class ConfigurationError(Exception):
@@ -55,7 +60,9 @@ def rows_to_csv(rows: list[dict[str, str]]) -> str:
     return output.getvalue()
 
 
-async def _check_phone_batch(raw: str) -> list[dict[str, str]]:
+async def _check_phone_batch(
+    raw: str, progress: Callable[[int, int, str], None] | None = None
+) -> list[dict[str, str]]:
     missing = [name for name in ("API_ID", "API_HASH", "PHONE_NUMBER") if not os.getenv(name)]
     if missing:
         raise ConfigurationError(f"Не заданы {', '.join(missing)} в .env")
@@ -66,6 +73,12 @@ async def _check_phone_batch(raw: str) -> list[dict[str, str]]:
     )
     results_by_phone: dict[str, dict] = {}
 
+    def report(processed: int, message: str) -> None:
+        if progress:
+            progress(processed, len(entries), message)
+
+    report(0, "Задача принята. Подготавливаем проверку.")
+
     if valid_phones:
         client = await upstream.login(
             os.getenv("API_ID"), os.getenv("API_HASH"), os.getenv("PHONE_NUMBER")
@@ -73,10 +86,57 @@ async def _check_phone_batch(raw: str) -> list[dict[str, str]]:
         try:
             for start in range(0, len(valid_phones), BATCH_SIZE):
                 phones = valid_phones[start : start + BATCH_SIZE]
-                try:
-                    results_by_phone.update(await upstream.get_names_batch(client, phones))
-                except Exception as error:  # Telegram failures are reported per batch.
-                    results_by_phone.update({phone: {"error": str(error)} for phone in phones})
+                while True:
+                    try:
+                        batch_results = await upstream.get_names_batch(client, phones)
+                        retry_phones = [
+                            phone for phone, result in batch_results.items() if result.get("retry")
+                        ]
+                        results_by_phone.update(
+                            {
+                                phone: result
+                                for phone, result in batch_results.items()
+                                if phone not in retry_phones
+                            }
+                        )
+                        if retry_phones:
+                            phones = retry_phones
+                            report(
+                                sum(
+                                    1
+                                    for entry in entries
+                                    if entry["phone"] in results_by_phone
+                                    or not is_valid_phone(entry["phone"])
+                                ),
+                                "Telegram попросил повторить часть контактов. Ждём и повторяем их.",
+                            )
+                            await asyncio.sleep(RETRY_CONTACT_PAUSE_SECONDS)
+                            continue
+                        break
+                    except FloodWaitError as error:
+                        seconds = max(1, int(error.seconds))
+                        report(
+                            sum(
+                                1
+                                for entry in entries
+                                if entry["phone"] in results_by_phone
+                                or not is_valid_phone(entry["phone"])
+                            ),
+                            f"Telegram ограничил темп. Ждём {seconds} сек. и продолжим этот же пакет.",
+                        )
+                        await asyncio.sleep(seconds + 1)
+                    except Exception as error:  # Other Telegram failures are reported per batch.
+                        results_by_phone.update({phone: {"error": str(error)} for phone in phones})
+                        break
+                report(
+                    sum(
+                        1
+                        for entry in entries
+                        if entry["phone"] in results_by_phone
+                        or not is_valid_phone(entry["phone"])
+                    ),
+                    "Проверяем следующий пакет." if start + BATCH_SIZE < len(valid_phones) else "Собираем результаты.",
+                )
                 if start + BATCH_SIZE < len(valid_phones):
                     await asyncio.sleep(BATCH_PAUSE_SECONDS)
         finally:
@@ -100,6 +160,7 @@ async def _check_phone_batch(raw: str) -> list[dict[str, str]]:
                 "detail": "Введите номер в международном формате, например +79991234567.",
             }
         rows.append({"company_name": entry["company_name"], "company_link": entry["company_link"], **row})
+    report(len(rows), "Готово.")
     return rows
 
 
@@ -107,8 +168,26 @@ def check_phone_batch(raw: str) -> list[dict[str, str]]:
     return asyncio.run(_check_phone_batch(raw))
 
 
-def render_page(rows: list[dict[str, str]] | None = None, error: str = "") -> str:
+def render_page(
+    rows: list[dict[str, str]] | None = None,
+    error: str = "",
+    job: dict | None = None,
+) -> str:
     rows = rows or []
+    job_html = ""
+    download_url = "/download.csv"
+    refresh_html = ""
+    if job:
+        if job["complete"]:
+            rows = job["rows"]
+            error = job["error"]
+            download_url = f"/download.csv?job={job['id']}"
+        else:
+            job_html = (
+                f"<p>В очереди и обработке: {job['processed']} из {job['total']}.</p>"
+                f"<p class=\"hint\">{html.escape(job['message'])}</p>"
+            )
+            refresh_html = '<meta http-equiv="refresh" content="2">'
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     result_html = ""
     if rows:
@@ -126,15 +205,16 @@ def render_page(rows: list[dict[str, str]] | None = None, error: str = "") -> st
         headers = "".join(f"<th>{html.escape(field)}</th>" for field in ROW_FIELDS)
         result_html = (
             f"<p>Обработано номеров: {len(rows)}</p>"
-            '<p><a class="button" href="/download.csv">Скачать CSV</a></p>'
+            f'<p><a class="button" href="{download_url}">Скачать CSV</a></p>'
             f"<table><thead><tr>{headers}</tr></thead><tbody>{body}</tbody></table>"
         )
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><title>Telegram validator</title>
+{refresh_html}
 <style>body{{font:16px system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 20px;color:#18212b}}textarea{{width:100%;min-height:220px;box-sizing:border-box;font:inherit}}button,.button{{display:inline-block;background:#276ef1;color:white;padding:10px 14px;border:0;border-radius:6px;text-decoration:none;font:inherit;cursor:pointer}}label{{display:block;margin:16px 0 8px}}.hint{{color:#586574}}.error{{color:#b42318}}table{{border-collapse:collapse;width:100%;font-size:14px;margin-top:16px}}th,td{{border:1px solid #d0d5dd;padding:8px;text-align:left;vertical-align:top;word-break:break-word}}th{{background:#f2f4f7}}</style>
 </head><body><h1>Проверка номеров Telegram</h1>
-<p class="hint">Вставьте номера по одному в строке, в международном формате. Можно предварять группу номеров строкой <code>[Название компании](https://example.com)</code>. Результат «не найден» также может означать ограничение приватности.</p>
-{error_html}<form method="post" action="/check"><label for="phone_numbers">Номера телефонов</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="+79991234567&#10;+447911123456"></textarea><p><button type="submit">Проверить</button></p></form>{result_html}
+<p class="hint">Вставьте номера по одному в строке, в международном формате. Перед группой можно указать название компании обычной строкой или в виде <code>[Название компании](https://example.com)</code>. Очередь соблюдает паузы Telegram и не пропускает пакет при ограничении.</p>
+{error_html}<form method="post" action="/check"><label for="phone_numbers">Компании и номера</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="ООО Пример&#10;+79991234567&#10;+447911123456"></textarea><p><button type="submit">Поставить в очередь</button></p></form>{job_html}{result_html}
 </body></html>"""
 
 
@@ -142,6 +222,68 @@ class ValidatorApplication:
     def __init__(self, check_batch: Callable[[str], list[dict[str, str]]] = check_phone_batch):
         self.check_batch = check_batch
         self.last_rows: list[dict[str, str]] = []
+        self.jobs: dict[str, dict] = {}
+        self._state_lock = Lock()
+        self._worker_lock = Lock()
+
+    def enqueue(self, raw: str) -> str:
+        job_id = uuid4().hex
+        with self._state_lock:
+            self.jobs[job_id] = {
+                "id": job_id,
+                "total": len(parse_company_phone_batch(raw)),
+                "processed": 0,
+                "message": "Задача поставлена в очередь.",
+                "rows": [],
+                "error": "",
+                "complete": False,
+            }
+        Thread(target=self._run_job, args=(job_id, raw), daemon=True).start()
+        return job_id
+
+    def snapshot(self, job_id: str) -> dict | None:
+        with self._state_lock:
+            job = self.jobs.get(job_id)
+            return dict(job) if job else None
+
+    def _update_job(self, job_id: str, **updates) -> None:
+        with self._state_lock:
+            self.jobs[job_id].update(updates)
+
+    def _run_job(self, job_id: str, raw: str) -> None:
+        with self._worker_lock:
+            self._update_job(job_id, message="Проверка запущена.")
+            try:
+                if self.check_batch is check_phone_batch:
+                    rows = asyncio.run(
+                        _check_phone_batch(
+                            raw,
+                            progress=lambda processed, total, message: self._update_job(
+                                job_id, processed=processed, total=total, message=message
+                            ),
+                        )
+                    )
+                else:
+                    rows = self.check_batch(raw)
+            except ConfigurationError as error:
+                self._update_job(job_id, error=str(error), complete=True, message="Не настроено.")
+                return
+            except EOFError:
+                self._update_job(
+                    job_id,
+                    error="Требуется авторизация Telegram в терминале. Перезапустите проверку после входа в аккаунт.",
+                    complete=True,
+                    message="Требуется авторизация.",
+                )
+                return
+            except Exception as error:
+                self._update_job(job_id, error=str(error), complete=True, message="Ошибка обработки.")
+                return
+            with self._state_lock:
+                self.jobs[job_id].update(
+                    rows=rows, processed=len(rows), complete=True, message="Готово."
+                )
+                self.last_rows = rows
 
     def handler(self):
         application = self
@@ -155,9 +297,26 @@ class ValidatorApplication:
                 self.end_headers()
                 self.wfile.write(encoded)
 
+            def send_redirect(self, location: str):
+                self.send_response(303)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
             def do_GET(self):
-                if urlparse(self.path).path == "/download.csv":
-                    self.send_content(rows_to_csv(application.last_rows), "text/csv; charset=utf-8")
+                parsed = urlparse(self.path)
+                if parsed.path == "/download.csv":
+                    job_id = parse_qs(parsed.query).get("job", [""])[0]
+                    job = application.snapshot(job_id) if job_id else None
+                    rows = job["rows"] if job else application.last_rows
+                    self.send_content(rows_to_csv(rows), "text/csv; charset=utf-8")
+                    return
+                if parsed.path.startswith("/jobs/"):
+                    job = application.snapshot(parsed.path.removeprefix("/jobs/"))
+                    if not job:
+                        self.send_error(404)
+                        return
+                    self.send_content(render_page(job=job))
                     return
                 self.send_content(render_page(application.last_rows))
 
@@ -168,18 +327,7 @@ class ValidatorApplication:
                 length = int(self.headers.get("Content-Length", "0"))
                 values = parse_qs(self.rfile.read(length).decode("utf-8"))
                 phone_numbers = values.get("phone_numbers", [""])[0]
-                try:
-                    application.last_rows = application.check_batch(phone_numbers)
-                    self.send_content(render_page(application.last_rows))
-                except ConfigurationError as error:
-                    self.send_content(render_page(error=str(error)))
-                except EOFError:
-                    self.send_content(
-                        render_page(
-                            error="Требуется авторизация Telegram в терминале. "
-                            "Перезапустите проверку после входа в аккаунт."
-                        )
-                    )
+                self.send_redirect(f"/jobs/{application.enqueue(phone_numbers)}")
 
             def log_message(self, format: str, *args):
                 return

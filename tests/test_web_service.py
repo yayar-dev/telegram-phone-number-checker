@@ -42,6 +42,23 @@ def test_parses_markdown_company_headers_without_creating_invalid_rows():
     ]
 
 
+def test_parses_plain_company_names_without_links():
+    assert parse_company_phone_batch(
+        'ААУ "ЦФОП АПК"\t\n+7 (495) 540-42-86\n\nООО ПКО "ФИЛБЕРТ"\n+7 (812) 313-87-86'
+    ) == [
+        {
+            "company_name": 'ААУ "ЦФОП АПК"',
+            "company_link": "",
+            "phone": "+74955404286",
+        },
+        {
+            "company_name": 'ООО ПКО "ФИЛБЕРТ"',
+            "company_link": "",
+            "phone": "+78123138786",
+        },
+    ]
+
+
 def test_rejects_phone_without_international_prefix():
     assert is_valid_phone("79991234567") is False
 

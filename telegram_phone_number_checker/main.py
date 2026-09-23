@@ -167,7 +167,10 @@ async def get_names_batch(client: TelegramClient, phone_numbers: list[str]) -> d
                 if index in retry_contact_ids
                 else "No response, the phone number is not on Telegram or has blocked contact adding."
             )
-            results[phone_number] = {"error": message}
+            results[phone_number] = {
+                "error": message,
+                "retry": index in retry_contact_ids,
+            }
             continue
 
         imported_user_ids_to_delete.append(user_id)
