@@ -6,6 +6,26 @@
 
 Python tool/script to check if phone numbers are connected to Telegram accounts. Retrieving username, name, and IDs where available.
 
+## Local web interface
+
+The project also includes a small local web interface for checking a pasted batch of phone numbers. It has no external web dependencies.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+cp .env.example .env
+```
+
+Fill `API_ID`, `API_HASH`, and `PHONE_NUMBER` in `.env`, then start it:
+
+```bash
+.venv/bin/python -m telegram_phone_number_checker.web
+```
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000), paste one phone number per line, and click **Проверить**. The result appears in the browser and is available as CSV.
+
+The status `NOT_FOUND_OR_PRIVACY_RESTRICTED` means Telegram did not return a contact match. It can mean there is no account or that the account cannot be found by phone number because of privacy settings.
+
 > ⚠️ NB: We advise you **not to use your personal account** for automations as telegram may block it. A fresh account works best from residential IPs rather than known VPN IPs.
  
 ## Installation
