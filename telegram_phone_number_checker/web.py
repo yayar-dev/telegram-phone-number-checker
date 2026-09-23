@@ -6,6 +6,7 @@ import html
 import inspect
 import io
 import os
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock, Thread
 from typing import Callable
@@ -35,7 +36,8 @@ ROW_FIELDS = (
 )
 BATCH_SIZE = 10
 BATCH_PAUSE_SECONDS = 1
-RETRY_CONTACT_PAUSE_SECONDS = 30
+RETRY_CONTACT_PAUSE_SECONDS = 60
+MAX_RETRY_CONTACT_PAUSE_SECONDS = 600
 
 
 class ConfigurationError(Exception):
@@ -84,8 +86,30 @@ async def _check_phone_batch(
             os.getenv("API_ID"), os.getenv("API_HASH"), os.getenv("PHONE_NUMBER")
         )
         try:
-            for start in range(0, len(valid_phones), BATCH_SIZE):
-                phones = valid_phones[start : start + BATCH_SIZE]
+            pending_batches = deque(
+                (valid_phones[start : start + BATCH_SIZE], 0)
+                for start in range(0, len(valid_phones), BATCH_SIZE)
+            )
+            deferred_batches = deque()
+            while pending_batches or deferred_batches:
+                if pending_batches:
+                    phones, retry_attempt = pending_batches.popleft()
+                else:
+                    phones, retry_attempt = deferred_batches.popleft()
+                    wait_seconds = min(
+                        RETRY_CONTACT_PAUSE_SECONDS * 2 ** (retry_attempt - 1),
+                        MAX_RETRY_CONTACT_PAUSE_SECONDS,
+                    )
+                    report(
+                        sum(
+                            1
+                            for entry in entries
+                            if entry["phone"] in results_by_phone
+                            or not is_valid_phone(entry["phone"])
+                        ),
+                        f"Telegram отложил {len(phones)} контактов. Повтор № {retry_attempt} через {wait_seconds} сек.",
+                    )
+                    await asyncio.sleep(wait_seconds)
                 while True:
                     try:
                         batch_results = await upstream.get_names_batch(client, phones)
@@ -100,7 +124,7 @@ async def _check_phone_batch(
                             }
                         )
                         if retry_phones:
-                            phones = retry_phones
+                            deferred_batches.append((retry_phones, retry_attempt + 1))
                             report(
                                 sum(
                                     1
@@ -108,10 +132,8 @@ async def _check_phone_batch(
                                     if entry["phone"] in results_by_phone
                                     or not is_valid_phone(entry["phone"])
                                 ),
-                                "Telegram попросил повторить часть контактов. Ждём и повторяем их.",
+                                f"Telegram попросил повторить {len(retry_phones)} контактов. Продолжаем другие пакеты.",
                             )
-                            await asyncio.sleep(RETRY_CONTACT_PAUSE_SECONDS)
-                            continue
                         break
                     except FloodWaitError as error:
                         seconds = max(1, int(error.seconds))
@@ -135,9 +157,14 @@ async def _check_phone_batch(
                         if entry["phone"] in results_by_phone
                         or not is_valid_phone(entry["phone"])
                     ),
-                    "Проверяем следующий пакет." if start + BATCH_SIZE < len(valid_phones) else "Собираем результаты.",
+                    (
+                        f"Проверяем следующий пакет. Отложено к повтору: "
+                        f"{sum(len(batch[0]) for batch in deferred_batches)}."
+                        if pending_batches
+                        else "Собираем результаты."
+                    ),
                 )
-                if start + BATCH_SIZE < len(valid_phones):
+                if pending_batches and BATCH_PAUSE_SECONDS:
                     await asyncio.sleep(BATCH_PAUSE_SECONDS)
         finally:
             disconnected = client.disconnect()
