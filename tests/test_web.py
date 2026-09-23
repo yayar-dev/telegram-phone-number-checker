@@ -101,3 +101,30 @@ def test_web_form_shows_configuration_problem_without_calling_telegram():
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_web_form_shows_authorization_problem_instead_of_dropping_response():
+    def check_batch(raw: str):
+        raise EOFError("EOF when reading a Telegram code")
+
+    app = web.ValidatorApplication(check_batch=check_batch)
+    server = web.create_server(app, host="127.0.0.1", port=0)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port)
+        body = urlencode({"phone_numbers": "+79991234567"})
+        connection.request(
+            "POST",
+            "/check",
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response = connection.getresponse()
+        page = response.read().decode()
+        assert response.status == 200
+        assert "Требуется авторизация Telegram" in page
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

@@ -169,6 +169,13 @@ class ValidatorApplication:
                     self.send_content(render_page(application.last_rows))
                 except ConfigurationError as error:
                     self.send_content(render_page(error=str(error)))
+                except EOFError:
+                    self.send_content(
+                        render_page(
+                            error="Требуется авторизация Telegram в терминале. "
+                            "Перезапустите проверку после входа в аккаунт."
+                        )
+                    )
 
             def log_message(self, format: str, *args):
                 return
