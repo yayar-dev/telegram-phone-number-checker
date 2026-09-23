@@ -37,7 +37,13 @@ def rows_to_csv(rows: list[dict[str, str]]) -> str:
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=ROW_FIELDS)
     writer.writeheader()
-    writer.writerows(rows)
+    for row in rows:
+        writer.writerow(
+            {
+                field: f"'{row[field]}" if row[field].startswith(("=", "+", "-", "@")) else row[field]
+                for field in ROW_FIELDS
+            }
+        )
     return output.getvalue()
 
 

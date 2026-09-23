@@ -5,6 +5,26 @@ from urllib.parse import urlencode
 from telegram_phone_number_checker import web
 
 
+def test_csv_neutralizes_spreadsheet_formula_cells():
+    csv_text = web.rows_to_csv(
+        [
+            {
+                "phone": "+79991234567",
+                "status": "FOUND",
+                "telegram_id": "123",
+                "username": "=HYPERLINK(\"https://example.test\")",
+                "name": "@formula",
+                "telegram_link": "https://t.me/test_user",
+                "detail": "-danger",
+            }
+        ]
+    )
+    assert "'+79991234567" in csv_text
+    assert "'=HYPERLINK" in csv_text
+    assert "'@formula" in csv_text
+    assert "'-danger" in csv_text
+
+
 def test_web_form_renders_results_and_downloads_csv():
     def check_batch(raw: str):
         assert raw == "+79991234567"

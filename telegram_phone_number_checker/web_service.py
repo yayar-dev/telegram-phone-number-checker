@@ -11,8 +11,11 @@ def parse_phone_batch(raw: str) -> list[str]:
         stripped = line.strip()
         if not stripped:
             continue
-        digits = "".join(character for character in stripped if character.isdigit())
-        phone = f"+{digits}" if stripped.startswith("+") else stripped
+        if any(character.isalpha() for character in stripped):
+            phone = stripped
+        else:
+            digits = "".join(character for character in stripped if character.isdigit())
+            phone = f"+{digits}" if stripped.startswith("+") else stripped
         if phone not in phones:
             phones.append(phone)
     return phones

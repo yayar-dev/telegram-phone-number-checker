@@ -15,6 +15,12 @@ def test_rejects_phone_without_international_prefix():
     assert is_valid_phone("79991234567") is False
 
 
+def test_rejects_phone_with_extension_instead_of_changing_its_digits():
+    phone = parse_phone_batch("+1 202 555 0123 ext 4")[0]
+    assert phone == "+1 202 555 0123 ext 4"
+    assert is_valid_phone(phone) is False
+
+
 def test_maps_username_less_match_without_inventing_link():
     assert map_lookup_result(
         "+79991234567",
