@@ -2,26 +2,60 @@ import re
 
 
 PHONE_PATTERN = re.compile(r"^\+[1-9]\d{6,14}$")
+COMPANY_HEADER_PATTERN = re.compile(
+    r"^\[(?P<company_name>.+)\]\((?P<company_link>https?://[^\s]+)\)$"
+)
+
+
+def normalize_phone_line(line: str) -> str:
+    """Normalize punctuation in one pasted phone number without guessing a prefix."""
+    stripped = line.strip()
+    if (
+        len(stripped) >= 2
+        and stripped[0] == stripped[-1]
+        and stripped[0] in {"\"", "'"}
+    ):
+        stripped = stripped[1:-1].strip()
+    if any(character.isalpha() for character in stripped):
+        return stripped
+    digits = "".join(character for character in stripped if character.isdigit())
+    return f"+{digits}" if stripped.startswith("+") else stripped
+
+
+def parse_company_phone_batch(raw: str) -> list[dict[str, str]]:
+    """Parse optional Markdown company headers and their following phone numbers."""
+    rows: list[dict[str, str]] = []
+    company_name = ""
+    company_link = ""
+    seen: set[tuple[str, str, str]] = set()
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        header = COMPANY_HEADER_PATTERN.fullmatch(stripped)
+        if header:
+            company_name = header.group("company_name")
+            company_link = header.group("company_link")
+            continue
+        phone = normalize_phone_line(stripped)
+        key = (company_name, company_link, phone)
+        if key not in seen:
+            rows.append(
+                {
+                    "company_name": company_name,
+                    "company_link": company_link,
+                    "phone": phone,
+                }
+            )
+            seen.add(key)
+    return rows
 
 
 def parse_phone_batch(raw: str) -> list[str]:
     """Return unique, lightly formatted international phone numbers in input order."""
     phones: list[str] = []
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if (
-            len(stripped) >= 2
-            and stripped[0] == stripped[-1]
-            and stripped[0] in {"\"", "'"}
-        ):
-            stripped = stripped[1:-1].strip()
-        if not stripped:
-            continue
-        if any(character.isalpha() for character in stripped):
-            phone = stripped
-        else:
-            digits = "".join(character for character in stripped if character.isdigit())
-            phone = f"+{digits}" if stripped.startswith("+") else stripped
+    for row in parse_company_phone_batch(raw):
+        phone = row["phone"]
         if phone not in phones:
             phones.append(phone)
     return phones

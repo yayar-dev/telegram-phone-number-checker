@@ -1,6 +1,7 @@
 from telegram_phone_number_checker.web_service import (
     is_valid_phone,
     map_lookup_result,
+    parse_company_phone_batch,
     parse_phone_batch,
 )
 
@@ -13,6 +14,32 @@ def test_parses_unique_normalized_phone_lines():
 
 def test_normalizes_phone_pasted_with_csv_quotes():
     assert parse_phone_batch('"+7 (812) 313-87-86"') == ["+78123138786"]
+
+
+def test_parses_markdown_company_headers_without_creating_invalid_rows():
+    assert parse_company_phone_batch(
+        "[ООО ПКО \"ФИЛБЕРТ\"](https://basis.myseldon.com/company/1107847250961)\n"
+        "+7 (812) 313-87-86\n"
+        "+7 (800) 333-01-25\n\n"
+        "[Другая компания](https://example.test/company/2)\n"
+        "+7 (921) 961-21-38"
+    ) == [
+        {
+            "company_name": 'ООО ПКО "ФИЛБЕРТ"',
+            "company_link": "https://basis.myseldon.com/company/1107847250961",
+            "phone": "+78123138786",
+        },
+        {
+            "company_name": 'ООО ПКО "ФИЛБЕРТ"',
+            "company_link": "https://basis.myseldon.com/company/1107847250961",
+            "phone": "+78003330125",
+        },
+        {
+            "company_name": "Другая компания",
+            "company_link": "https://example.test/company/2",
+            "phone": "+79219612138",
+        },
+    ]
 
 
 def test_rejects_phone_without_international_prefix():

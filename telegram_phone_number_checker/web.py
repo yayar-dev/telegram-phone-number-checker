@@ -14,11 +14,13 @@ from telegram_phone_number_checker import main as upstream
 from telegram_phone_number_checker.web_service import (
     is_valid_phone,
     map_lookup_result,
-    parse_phone_batch,
+    parse_company_phone_batch,
 )
 
 
 ROW_FIELDS = (
+    "company_name",
+    "company_link",
     "phone",
     "status",
     "telegram_id",
@@ -42,7 +44,11 @@ def rows_to_csv(rows: list[dict[str, str]]) -> str:
     for row in rows:
         writer.writerow(
             {
-                field: f"'{row[field]}" if row[field].startswith(("=", "+", "-", "@")) else row[field]
+                field: (
+                    f"'{row.get(field, '')}"
+                    if row.get(field, "").startswith(("=", "+", "-", "@"))
+                    else row.get(field, "")
+                )
                 for field in ROW_FIELDS
             }
         )
@@ -54,57 +60,46 @@ async def _check_phone_batch(raw: str) -> list[dict[str, str]]:
     if missing:
         raise ConfigurationError(f"Не заданы {', '.join(missing)} в .env")
 
-    rows: list[dict[str, str]] = []
-    valid_phones = []
-    for phone in parse_phone_batch(raw):
-        if is_valid_phone(phone):
-            valid_phones.append(phone)
-        else:
-            rows.append(
-                {
-                    "phone": phone,
-                    "status": "INVALID_PHONE",
-                    "telegram_id": "",
-                    "username": "",
-                    "name": "",
-                    "telegram_link": "",
-                    "detail": "Введите номер в международном формате, например +79991234567.",
-                }
-            )
-
-    if not valid_phones:
-        return rows
-
-    client = await upstream.login(
-        os.getenv("API_ID"), os.getenv("API_HASH"), os.getenv("PHONE_NUMBER")
+    entries = parse_company_phone_batch(raw)
+    valid_phones = list(
+        dict.fromkeys(entry["phone"] for entry in entries if is_valid_phone(entry["phone"]))
     )
-    try:
-        for start in range(0, len(valid_phones), BATCH_SIZE):
-            phones = valid_phones[start : start + BATCH_SIZE]
-            try:
-                results = await upstream.get_names_batch(client, phones)
-                rows.extend(
-                    map_lookup_result(phone, results[phone]) for phone in phones
-                )
-            except Exception as error:  # Telegram failures are reported per batch.
-                rows.extend(
-                    {
-                        "phone": phone,
-                        "status": "ERROR",
-                        "telegram_id": "",
-                        "username": "",
-                        "name": "",
-                        "telegram_link": "",
-                        "detail": str(error),
-                    }
-                    for phone in phones
-                )
-            if start + BATCH_SIZE < len(valid_phones):
-                await asyncio.sleep(BATCH_PAUSE_SECONDS)
-    finally:
-        disconnected = client.disconnect()
-        if inspect.isawaitable(disconnected):
-            await disconnected
+    results_by_phone: dict[str, dict] = {}
+
+    if valid_phones:
+        client = await upstream.login(
+            os.getenv("API_ID"), os.getenv("API_HASH"), os.getenv("PHONE_NUMBER")
+        )
+        try:
+            for start in range(0, len(valid_phones), BATCH_SIZE):
+                phones = valid_phones[start : start + BATCH_SIZE]
+                try:
+                    results_by_phone.update(await upstream.get_names_batch(client, phones))
+                except Exception as error:  # Telegram failures are reported per batch.
+                    results_by_phone.update({phone: {"error": str(error)} for phone in phones})
+                if start + BATCH_SIZE < len(valid_phones):
+                    await asyncio.sleep(BATCH_PAUSE_SECONDS)
+        finally:
+            disconnected = client.disconnect()
+            if inspect.isawaitable(disconnected):
+                await disconnected
+
+    rows: list[dict[str, str]] = []
+    for entry in entries:
+        phone = entry["phone"]
+        if is_valid_phone(phone):
+            row = map_lookup_result(phone, results_by_phone[phone])
+        else:
+            row = {
+                "phone": phone,
+                "status": "INVALID_PHONE",
+                "telegram_id": "",
+                "username": "",
+                "name": "",
+                "telegram_link": "",
+                "detail": "Введите номер в международном формате, например +79991234567.",
+            }
+        rows.append({"company_name": entry["company_name"], "company_link": entry["company_link"], **row})
     return rows
 
 
@@ -120,7 +115,8 @@ def render_page(rows: list[dict[str, str]] | None = None, error: str = "") -> st
         body = "".join(
             "<tr>"
             + "".join(
-                f"<td>{html.escape(row[field])}</td>" if field != "telegram_link" or not row[field]
+                f"<td>{html.escape(row.get(field, ''))}</td>"
+                if field not in {"company_link", "telegram_link"} or not row.get(field)
                 else f'<td><a href="{html.escape(row[field], quote=True)}" target="_blank" rel="noreferrer">{html.escape(row[field])}</a></td>'
                 for field in ROW_FIELDS
             )
@@ -137,7 +133,7 @@ def render_page(rows: list[dict[str, str]] | None = None, error: str = "") -> st
 <html lang="ru"><head><meta charset="utf-8"><title>Telegram validator</title>
 <style>body{{font:16px system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 20px;color:#18212b}}textarea{{width:100%;min-height:220px;box-sizing:border-box;font:inherit}}button,.button{{display:inline-block;background:#276ef1;color:white;padding:10px 14px;border:0;border-radius:6px;text-decoration:none;font:inherit;cursor:pointer}}label{{display:block;margin:16px 0 8px}}.hint{{color:#586574}}.error{{color:#b42318}}table{{border-collapse:collapse;width:100%;font-size:14px;margin-top:16px}}th,td{{border:1px solid #d0d5dd;padding:8px;text-align:left;vertical-align:top;word-break:break-word}}th{{background:#f2f4f7}}</style>
 </head><body><h1>Проверка номеров Telegram</h1>
-<p class="hint">Вставьте номера по одному в строке, в международном формате. Результат «не найден» также может означать ограничение приватности.</p>
+<p class="hint">Вставьте номера по одному в строке, в международном формате. Можно предварять группу номеров строкой <code>[Название компании](https://example.com)</code>. Результат «не найден» также может означать ограничение приватности.</p>
 {error_html}<form method="post" action="/check"><label for="phone_numbers">Номера телефонов</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="+79991234567&#10;+447911123456"></textarea><p><button type="submit">Проверить</button></p></form>{result_html}
 </body></html>"""
 

@@ -40,6 +40,47 @@ def test_web_uses_one_batch_lookup_for_valid_phone_numbers(monkeypatch):
     ]
 
 
+def test_web_keeps_company_context_for_each_phone(monkeypatch):
+    class Client:
+        async def disconnect(self):
+            return None
+
+    async def login(*args):
+        return Client()
+
+    async def get_names_batch(client, phones):
+        return {
+            phone: {"id": 123, "username": "test_user", "first_name": "Тест"}
+            for phone in phones
+        }
+
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
+    monkeypatch.setattr(web.upstream, "login", login)
+    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch, raising=False)
+
+    rows = asyncio.run(
+        web._check_phone_batch(
+            "[ООО Тест](https://example.test/company/1)\n+7 (999) 123-45-67"
+        )
+    )
+
+    assert rows == [
+        {
+            "company_name": "ООО Тест",
+            "company_link": "https://example.test/company/1",
+            "phone": "+79991234567",
+            "status": "FOUND",
+            "telegram_id": "123",
+            "username": "test_user",
+            "name": "Тест",
+            "telegram_link": "https://t.me/test_user",
+            "detail": "",
+        }
+    ]
+
+
 def test_web_splits_eleven_phones_into_batches_of_ten(monkeypatch):
     batch_calls = []
 
