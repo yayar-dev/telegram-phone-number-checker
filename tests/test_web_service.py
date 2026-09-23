@@ -31,7 +31,7 @@ def test_maps_username_less_match_without_inventing_link():
         "telegram_id": "123",
         "username": "",
         "name": "Иван Иванов",
-        "telegram_link": "",
+        "telegram_link": "https://t.me/+79991234567?profile",
         "detail": "",
     }
 

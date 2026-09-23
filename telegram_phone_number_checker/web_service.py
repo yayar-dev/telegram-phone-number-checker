@@ -56,6 +56,10 @@ def map_lookup_result(phone: str, result: dict) -> dict[str, str]:
         "telegram_id": str(result.get("id") or ""),
         "username": username,
         "name": name,
-        "telegram_link": f"https://t.me/{username}" if username else "",
+        "telegram_link": (
+            f"https://t.me/{username}"
+            if username
+            else f"https://t.me/{phone}?profile"
+        ),
         "detail": "",
     }
