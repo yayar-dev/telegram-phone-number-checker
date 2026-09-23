@@ -233,7 +233,7 @@ def test_web_queues_job_and_keeps_browser_responsive():
         connection.request(
             "POST",
             "/check",
-            body=urlencode({"phone_numbers": "+79991234567"}),
+            body=urlencode({"phone_numbers": "+79991234567", "queue_confirmation": "yes"}),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         response = connection.getresponse()
@@ -252,6 +252,37 @@ def test_web_queues_job_and_keeps_browser_responsive():
         assert response.status == 200
         assert "ООО Тест" in page
         assert "FOUND" in page
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_web_does_not_queue_without_explicit_confirmation():
+    calls = []
+
+    def check_batch(raw: str):
+        calls.append(raw)
+        return []
+
+    app = web.ValidatorApplication(check_batch=check_batch)
+    server = web.create_server(app, host="127.0.0.1", port=0)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port)
+        connection.request(
+            "POST",
+            "/check",
+            body=urlencode({"phone_numbers": "+79991234567"}),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response = connection.getresponse()
+        page = response.read().decode()
+        assert response.status == 200
+        assert "Нажмите «Поставить в очередь»" in page
+        time.sleep(0.05)
+        assert calls == []
     finally:
         server.shutdown()
         server.server_close()
@@ -279,7 +310,7 @@ def test_web_form_renders_results_and_downloads_csv():
     thread.start()
     try:
         connection = HTTPConnection("127.0.0.1", server.server_port)
-        body = urlencode({"phone_numbers": "+79991234567"})
+        body = urlencode({"phone_numbers": "+79991234567", "queue_confirmation": "yes"})
         connection.request(
             "POST",
             "/check",
@@ -323,7 +354,7 @@ def test_web_form_shows_configuration_problem_without_calling_telegram():
     thread.start()
     try:
         connection = HTTPConnection("127.0.0.1", server.server_port)
-        body = urlencode({"phone_numbers": "+79991234567"})
+        body = urlencode({"phone_numbers": "+79991234567", "queue_confirmation": "yes"})
         connection.request(
             "POST",
             "/check",
@@ -359,7 +390,7 @@ def test_web_form_shows_authorization_problem_instead_of_dropping_response():
     thread.start()
     try:
         connection = HTTPConnection("127.0.0.1", server.server_port)
-        body = urlencode({"phone_numbers": "+79991234567"})
+        body = urlencode({"phone_numbers": "+79991234567", "queue_confirmation": "yes"})
         connection.request(
             "POST",
             "/check",

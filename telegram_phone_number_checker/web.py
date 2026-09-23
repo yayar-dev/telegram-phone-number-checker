@@ -214,7 +214,8 @@ def render_page(
 <style>body{{font:16px system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 20px;color:#18212b}}textarea{{width:100%;min-height:220px;box-sizing:border-box;font:inherit}}button,.button{{display:inline-block;background:#276ef1;color:white;padding:10px 14px;border:0;border-radius:6px;text-decoration:none;font:inherit;cursor:pointer}}label{{display:block;margin:16px 0 8px}}.hint{{color:#586574}}.error{{color:#b42318}}table{{border-collapse:collapse;width:100%;font-size:14px;margin-top:16px}}th,td{{border:1px solid #d0d5dd;padding:8px;text-align:left;vertical-align:top;word-break:break-word}}th{{background:#f2f4f7}}</style>
 </head><body><h1>Проверка номеров Telegram</h1>
 <p class="hint">Вставьте номера по одному в строке, в международном формате. Перед группой можно указать название компании обычной строкой или в виде <code>[Название компании](https://example.com)</code>. Очередь соблюдает паузы Telegram и не пропускает пакет при ограничении.</p>
-{error_html}<form method="post" action="/check"><label for="phone_numbers">Компании и номера</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="ООО Пример&#10;+79991234567&#10;+447911123456"></textarea><p><button type="submit">Поставить в очередь</button></p></form>{job_html}{result_html}
+{error_html}<form id="queue-form" method="post" action="/check"><label for="phone_numbers">Компании и номера</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="ООО Пример&#10;+79991234567&#10;+447911123456"></textarea><input id="queue-confirmation" type="hidden" name="queue_confirmation" value=""><p><button id="queue-button" type="button">Поставить в очередь</button></p></form>{job_html}{result_html}
+<script>const form=document.getElementById('queue-form');const confirmation=document.getElementById('queue-confirmation');document.getElementById('queue-button').addEventListener('click',()=>{{confirmation.value='yes';form.requestSubmit();}});form.addEventListener('submit',(event)=>{{if(confirmation.value!=='yes')event.preventDefault();}});</script>
 </body></html>"""
 
 
@@ -327,6 +328,13 @@ class ValidatorApplication:
                 length = int(self.headers.get("Content-Length", "0"))
                 values = parse_qs(self.rfile.read(length).decode("utf-8"))
                 phone_numbers = values.get("phone_numbers", [""])[0]
+                if values.get("queue_confirmation", [""])[0] != "yes":
+                    self.send_content(
+                        render_page(
+                            error="Нажмите «Поставить в очередь», чтобы начать проверку."
+                        )
+                    )
+                    return
                 self.send_redirect(f"/jobs/{application.enqueue(phone_numbers)}")
 
             def log_message(self, format: str, *args):
