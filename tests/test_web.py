@@ -40,6 +40,33 @@ def test_web_uses_one_batch_lookup_for_valid_phone_numbers(monkeypatch):
     ]
 
 
+def test_web_splits_eleven_phones_into_batches_of_ten(monkeypatch):
+    batch_calls = []
+
+    class Client:
+        async def disconnect(self):
+            return None
+
+    async def login(*args):
+        return Client()
+
+    async def get_names_batch(client, phones):
+        batch_calls.append(phones)
+        return {phone: {"error": "No response"} for phone in phones}
+
+    phones = [f"+799900000{number:02d}" for number in range(1, 12)]
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
+    monkeypatch.setattr(web.upstream, "login", login)
+    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch, raising=False)
+    monkeypatch.setattr(web, "BATCH_PAUSE_SECONDS", 0)
+
+    asyncio.run(web._check_phone_batch("\n".join(phones)))
+
+    assert batch_calls == [phones[:10], phones[10:]]
+
+
 def test_csv_neutralizes_spreadsheet_formula_cells():
     csv_text = web.rows_to_csv(
         [

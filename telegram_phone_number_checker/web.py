@@ -27,7 +27,7 @@ ROW_FIELDS = (
     "telegram_link",
     "detail",
 )
-BATCH_SIZE = 20
+BATCH_SIZE = 10
 BATCH_PAUSE_SECONDS = 1
 
 

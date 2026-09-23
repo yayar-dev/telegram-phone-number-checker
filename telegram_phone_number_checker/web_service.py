@@ -9,6 +9,12 @@ def parse_phone_batch(raw: str) -> list[str]:
     phones: list[str] = []
     for line in raw.splitlines():
         stripped = line.strip()
+        if (
+            len(stripped) >= 2
+            and stripped[0] == stripped[-1]
+            and stripped[0] in {"\"", "'"}
+        ):
+            stripped = stripped[1:-1].strip()
         if not stripped:
             continue
         if any(character.isalpha() for character in stripped):

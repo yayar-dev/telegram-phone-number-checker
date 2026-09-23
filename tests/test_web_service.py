@@ -11,6 +11,10 @@ def test_parses_unique_normalized_phone_lines():
     ) == ["+79991234567", "+447911123456"]
 
 
+def test_normalizes_phone_pasted_with_csv_quotes():
+    assert parse_phone_batch('"+7 (812) 313-87-86"') == ["+78123138786"]
+
+
 def test_rejects_phone_without_international_prefix():
     assert is_valid_phone("79991234567") is False
 
