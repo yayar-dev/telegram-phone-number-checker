@@ -197,6 +197,45 @@ def test_web_continues_with_other_batches_while_retry_contacts_wait(monkeypatch)
     assert [row["status"] for row in rows] == ["FOUND", "FOUND"]
 
 
+def test_web_waits_once_before_retrying_multiple_deferred_batches(monkeypatch):
+    calls = []
+    pauses = []
+    attempts = {"+79990000001": 0, "+79990000002": 0}
+
+    class Client:
+        async def disconnect(self):
+            return None
+
+    async def login(*args):
+        return Client()
+
+    async def get_names_batch(client, phones):
+        phone = phones[0]
+        calls.append(phone)
+        attempts[phone] += 1
+        if attempts[phone] == 1:
+            return {phone: {"retry": True, "error": "Retry later"}}
+        return {phone: {"id": 123, "username": "test_user"}}
+
+    async def sleep(seconds):
+        pauses.append(seconds)
+
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
+    monkeypatch.setattr(web.upstream, "login", login)
+    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch, raising=False)
+    monkeypatch.setattr(web, "BATCH_SIZE", 1)
+    monkeypatch.setattr(web, "BATCH_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(web.asyncio, "sleep", sleep)
+
+    rows = asyncio.run(web._check_phone_batch("+79990000001\n+79990000002"))
+
+    assert calls == ["+79990000001", "+79990000002", "+79990000001", "+79990000002"]
+    assert pauses == [web.RETRY_CONTACT_PAUSE_SECONDS]
+    assert [row["status"] for row in rows] == ["FOUND", "FOUND"]
+
+
 def test_web_splits_eleven_phones_into_batches_of_ten(monkeypatch):
     batch_calls = []
 

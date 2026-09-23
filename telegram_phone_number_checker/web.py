@@ -101,21 +101,39 @@ async def _check_phone_batch(
                 for start in range(0, len(valid_phones), BATCH_SIZE)
             )
             deferred_batches = deque()
+
+            async def wait_for_deferred(seconds: int) -> bool:
+                """Wait for Telegram unless the user stops deferred contacts."""
+                if not skip_deferred:
+                    await asyncio.sleep(seconds)
+                    return True
+                remaining = seconds
+                while remaining:
+                    if skip_deferred():
+                        return False
+                    step = min(1, remaining)
+                    await asyncio.sleep(step)
+                    remaining -= step
+                return True
+
+            def skip_batches(batches) -> None:
+                for deferred_phones, _ in batches:
+                    results_by_phone.update(
+                        {
+                            phone: {
+                                "skipped": True,
+                                "error": "Проверка отложена пользователем.",
+                            }
+                            for phone in deferred_phones
+                        }
+                    )
+
             while pending_batches or deferred_batches:
                 if pending_batches:
                     phones, retry_attempt = pending_batches.popleft()
                 else:
                     if skip_deferred and skip_deferred():
-                        for deferred_phones, _ in deferred_batches:
-                            results_by_phone.update(
-                                {
-                                    phone: {
-                                        "skipped": True,
-                                        "error": "Проверка отложена пользователем.",
-                                    }
-                                    for phone in deferred_phones
-                                }
-                            )
+                        skip_batches(deferred_batches)
                         deferred_batches.clear()
                         report_deferred()
                         report(
@@ -128,12 +146,14 @@ async def _check_phone_batch(
                             "Отложенные контакты сняты с обработки.",
                         )
                         break
-                    phones, retry_attempt = deferred_batches.popleft()
-                    report_deferred(phones)
+                    batches_to_retry = deque(deferred_batches)
+                    deferred_batches.clear()
+                    retry_attempt = max(attempt for _, attempt in batches_to_retry)
                     wait_seconds = min(
                         RETRY_CONTACT_PAUSE_SECONDS * 2 ** (retry_attempt - 1),
                         MAX_RETRY_CONTACT_PAUSE_SECONDS,
                     )
+                    retry_count = sum(len(batch) for batch, _ in batches_to_retry)
                     report(
                         sum(
                             1
@@ -141,9 +161,27 @@ async def _check_phone_batch(
                             if entry["phone"] in results_by_phone
                             or not is_valid_phone(entry["phone"])
                         ),
-                        f"Telegram отложил {len(phones)} контактов. Повтор № {retry_attempt} через {wait_seconds} сек.",
+                        f"Telegram отложил {retry_count} контактов. Повтор № {retry_attempt} через {wait_seconds} сек.",
                     )
-                    await asyncio.sleep(wait_seconds)
+                    report_deferred(
+                        [phone for batch, _ in batches_to_retry for phone in batch]
+                    )
+                    if not await wait_for_deferred(wait_seconds):
+                        skip_batches(batches_to_retry)
+                        report_deferred()
+                        report(
+                            sum(
+                                1
+                                for entry in entries
+                                if entry["phone"] in results_by_phone
+                                or not is_valid_phone(entry["phone"])
+                            ),
+                            "Отложенные контакты сняты с обработки.",
+                        )
+                        break
+                    pending_batches.extend(batches_to_retry)
+                    report_deferred()
+                    continue
                 while True:
                     try:
                         batch_results = await upstream.get_names_batch(client, phones)
