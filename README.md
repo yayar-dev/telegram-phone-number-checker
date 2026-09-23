@@ -12,7 +12,7 @@ The project also includes a small local web interface for checking a pasted batc
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pip install -r requirements.txt
 cp .env.example .env
 ```
 
