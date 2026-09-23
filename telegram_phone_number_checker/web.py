@@ -180,9 +180,21 @@ def create_server(application: ValidatorApplication, host: str = "127.0.0.1", po
     return ThreadingHTTPServer((host, port), application.handler())
 
 
+def get_port() -> int:
+    value = os.getenv("TELEGRAM_VALIDATOR_PORT", "8000")
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise ValueError("TELEGRAM_VALIDATOR_PORT must be a number.") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("TELEGRAM_VALIDATOR_PORT must be between 1 and 65535.")
+    return port
+
+
 def main() -> None:
-    server = create_server(ValidatorApplication())
-    print("Откройте http://127.0.0.1:8000")
+    port = get_port()
+    server = create_server(ValidatorApplication(), port=port)
+    print(f"Откройте http://127.0.0.1:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

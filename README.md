@@ -19,10 +19,10 @@ cp .env.example .env
 Fill `API_ID`, `API_HASH`, and `PHONE_NUMBER` in `.env`, then start it:
 
 ```bash
-.venv/bin/python -m telegram_phone_number_checker.web
+TELEGRAM_VALIDATOR_PORT=8010 .venv/bin/python -m telegram_phone_number_checker.web
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000), paste one phone number per line, and click **Проверить**. The result appears in the browser and is available as CSV.
+Open [http://127.0.0.1:8010](http://127.0.0.1:8010), paste one phone number per line, and click **Проверить**. The result appears in the browser and is available as CSV. Set `TELEGRAM_VALIDATOR_PORT` to another free port if needed.
 
 The status `NOT_FOUND_OR_PRIVACY_RESTRICTED` means Telegram did not return a contact match. It can mean there is no account or that the account cannot be found by phone number because of privacy settings.
 

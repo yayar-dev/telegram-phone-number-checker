@@ -5,6 +5,11 @@ from urllib.parse import urlencode
 from telegram_phone_number_checker import web
 
 
+def test_reads_custom_port_from_environment(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_VALIDATOR_PORT", "8010")
+    assert web.get_port() == 8010
+
+
 def test_csv_neutralizes_spreadsheet_formula_cells():
     csv_text = web.rows_to_csv(
         [
