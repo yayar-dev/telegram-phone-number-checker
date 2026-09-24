@@ -41,6 +41,7 @@ BATCH_SIZE = 10
 BATCH_PAUSE_SECONDS = 1
 RETRY_CONTACT_PAUSE_SECONDS = 60
 MAX_RETRY_CONTACT_PAUSE_SECONDS = 600
+MAX_DEFERRED_RETRY_ATTEMPTS = 3
 
 
 class ConfigurationError(Exception):
@@ -156,13 +157,13 @@ async def _check_phone_batch(
                     remaining -= step
                 return True
 
-            def skip_batches(batches) -> None:
+            def skip_batches(batches, error: str = "Проверка отложена пользователем.") -> None:
                 for deferred_phones, _ in batches:
                     results_by_phone.update(
                         {
-                            phone: {
-                                "skipped": True,
-                                "error": "Проверка отложена пользователем.",
+                                    phone: {
+                                        "skipped": True,
+                                        "error": error,
                             }
                             for phone in deferred_phones
                         }
@@ -190,6 +191,26 @@ async def _check_phone_batch(
                     batches_to_retry = deque(deferred_batches)
                     deferred_batches.clear()
                     retry_attempt = max(attempt for _, attempt in batches_to_retry)
+                    if retry_attempt >= MAX_DEFERRED_RETRY_ATTEMPTS:
+                        skip_batches(
+                            batches_to_retry,
+                            error=(
+                                "Telegram повторно отложил контакт после нескольких попыток. "
+                                "Повторите проверку позже."
+                            ),
+                        )
+                        save_checkpoint()
+                        report_deferred([phone for batch, _ in batches_to_retry for phone in batch])
+                        report(
+                            sum(
+                                1
+                                for entry in entries
+                                if entry["phone"] in results_by_phone
+                                or not is_valid_phone(entry["phone"])
+                            ),
+                            "Telegram не принял отложенные контакты после 3 попыток. Они помечены для повторной проверки позже.",
+                        )
+                        break
                     wait_seconds = min(
                         RETRY_CONTACT_PAUSE_SECONDS * 2 ** (retry_attempt - 1),
                         MAX_RETRY_CONTACT_PAUSE_SECONDS,
