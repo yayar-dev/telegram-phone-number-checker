@@ -283,6 +283,35 @@ def test_csv_neutralizes_spreadsheet_formula_cells():
     assert "'-danger" in csv_text
 
 
+def test_job_state_survives_restart_and_keeps_completed_phone_results(tmp_path):
+    state_path = tmp_path / "jobs.json"
+    app = web.ValidatorApplication(state_path=state_path)
+    job_id = app.enqueue("ООО Тест\n+79991234567\n+79990000000")
+    app._update_job(
+        job_id,
+        started=True,
+        processed=1,
+        results_by_phone={"+79991234567": {"id": 123, "username": "test_user"}},
+    )
+
+    restored = web.ValidatorApplication(state_path=state_path)
+    job = restored.snapshot(job_id)
+
+    assert job["started"] is False
+    assert job["results_by_phone"]["+79991234567"]["id"] == 123
+    assert "перезапущен" in job["message"]
+
+
+def test_deferred_csv_rows_keep_company_context():
+    rows = web.deferred_rows(
+        "ООО Тест\n+79991234567",
+        ["+79991234567"],
+    )
+
+    assert rows[0]["company_name"] == "ООО Тест"
+    assert rows[0]["status"] == "DEFERRED_NOT_CHECKED"
+
+
 def test_web_queues_job_and_keeps_browser_responsive():
     calls = []
 

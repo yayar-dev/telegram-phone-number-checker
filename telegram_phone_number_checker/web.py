@@ -5,9 +5,12 @@ import csv
 import html
 import inspect
 import io
+import json
 import os
+import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Lock, Thread
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
@@ -62,21 +65,51 @@ def rows_to_csv(rows: list[dict[str, str]]) -> str:
     return output.getvalue()
 
 
+def deferred_rows(raw: str, phones: list[str]) -> list[dict[str, str]]:
+    """Return export rows for contacts that Telegram asked to retry later."""
+    deferred = set(phones)
+    return [
+        {
+            "company_name": entry["company_name"],
+            "company_link": entry["company_link"],
+            "phone": entry["phone"],
+            "status": "DEFERRED_NOT_CHECKED",
+            "telegram_id": "",
+            "username": "",
+            "name": "",
+            "telegram_link": "",
+            "detail": "Telegram попросил повторить контакт позже.",
+        }
+        for entry in parse_company_phone_batch(raw)
+        if entry["phone"] in deferred
+    ]
+
+
 async def _check_phone_batch(
     raw: str,
     progress: Callable[[int, int, str], None] | None = None,
     skip_deferred: Callable[[], bool] | None = None,
     deferred: Callable[[list[str]], None] | None = None,
+    initial_results: dict[str, dict] | None = None,
+    checkpoint: Callable[[dict[str, dict]], None] | None = None,
 ) -> list[dict[str, str]]:
     missing = [name for name in ("API_ID", "API_HASH", "PHONE_NUMBER") if not os.getenv(name)]
     if missing:
         raise ConfigurationError(f"Не заданы {', '.join(missing)} в .env")
 
     entries = parse_company_phone_batch(raw)
+    results_by_phone: dict[str, dict] = dict(initial_results or {})
     valid_phones = list(
-        dict.fromkeys(entry["phone"] for entry in entries if is_valid_phone(entry["phone"]))
+        dict.fromkeys(
+            entry["phone"]
+            for entry in entries
+            if is_valid_phone(entry["phone"]) and entry["phone"] not in results_by_phone
+        )
     )
-    results_by_phone: dict[str, dict] = {}
+
+    def save_checkpoint() -> None:
+        if checkpoint:
+            checkpoint(dict(results_by_phone))
 
     def report(processed: int, message: str) -> None:
         if progress:
@@ -89,7 +122,14 @@ async def _check_phone_batch(
                 + [phone for batch, _ in deferred_batches for phone in batch]
             )
 
-    report(0, "Задача принята. Подготавливаем проверку.")
+    report(
+        sum(
+            1
+            for entry in entries
+            if entry["phone"] in results_by_phone or not is_valid_phone(entry["phone"])
+        ),
+        "Задача принята. Подготавливаем проверку.",
+    )
 
     if valid_phones:
         client = await upstream.login(
@@ -134,6 +174,7 @@ async def _check_phone_batch(
                 else:
                     if skip_deferred and skip_deferred():
                         skip_batches(deferred_batches)
+                        save_checkpoint()
                         deferred_batches.clear()
                         report_deferred()
                         report(
@@ -168,6 +209,7 @@ async def _check_phone_batch(
                     )
                     if not await wait_for_deferred(wait_seconds):
                         skip_batches(batches_to_retry)
+                        save_checkpoint()
                         report_deferred()
                         report(
                             sum(
@@ -195,6 +237,7 @@ async def _check_phone_batch(
                                 if phone not in retry_phones
                             }
                         )
+                        save_checkpoint()
                         if retry_phones:
                             deferred_batches.append((retry_phones, retry_attempt + 1))
                             report_deferred()
@@ -222,6 +265,7 @@ async def _check_phone_batch(
                         await asyncio.sleep(seconds + 1)
                     except Exception as error:  # Other Telegram failures are reported per batch.
                         results_by_phone.update({phone: {"error": str(error)} for phone in phones})
+                        save_checkpoint()
                         break
                 report_deferred()
                 report(
@@ -300,10 +344,18 @@ def render_page(
                 deferred_html = (
                     f"<details><summary>Отложено к повтору: {len(job['deferred_phones'])}</summary>"
                     f"<ul>{phones}</ul></details>"
+                    f'<p><a href="/deferred.csv?job={job["id"]}">Скачать отложенные CSV</a></p>'
+                )
+            eta_html = ""
+            if job.get("eta_seconds") is not None:
+                eta_html = (
+                    f'<p class="hint">Оценка до завершения: примерно '
+                    f'{job["eta_seconds"] // 60} мин. {job["eta_seconds"] % 60} сек.</p>'
                 )
             job_html = (
                 f"<p>В очереди и обработке: {job['processed']} из {job['total']}.</p>"
                 f"<p class=\"hint\">{html.escape(job['message'])}</p>"
+                f"{eta_html}"
                 f"{deferred_html}"
                 f'<form method="post" action="/jobs/{job["id"]}/stop-deferred">'
                 '<button type="submit">Не проверять отложенные</button></form>'
@@ -341,12 +393,51 @@ def render_page(
 
 
 class ValidatorApplication:
-    def __init__(self, check_batch: Callable[[str], list[dict[str, str]]] = check_phone_batch):
+    def __init__(
+        self,
+        check_batch: Callable[[str], list[dict[str, str]]] = check_phone_batch,
+        state_path: Path | None = None,
+    ):
         self.check_batch = check_batch
+        self.state_path = state_path
         self.last_rows: list[dict[str, str]] = []
         self.jobs: dict[str, dict] = {}
         self._state_lock = Lock()
         self._worker_lock = Lock()
+        self._load_state()
+
+    def _save_locked(self) -> None:
+        if not self.state_path:
+            return
+        temporary_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps({"jobs": self.jobs, "last_rows": self.last_rows}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary_path.replace(self.state_path)
+
+    def _load_state(self) -> None:
+        if not self.state_path or not self.state_path.exists():
+            return
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.jobs = state.get("jobs", {})
+            self.last_rows = state.get("last_rows", [])
+            for job in self.jobs.values():
+                job.setdefault("results_by_phone", {})
+                job.setdefault("deferred_phones", [])
+                job.setdefault("skip_deferred", False)
+                job.setdefault("started", False)
+                job.setdefault("complete", False)
+                if job["started"] and not job["complete"]:
+                    job.update(
+                        started=False,
+                        message="Сервер был перезапущен. Нажмите «Запустить обработку» для продолжения.",
+                    )
+            self._save_locked()
+        except (OSError, json.JSONDecodeError):
+            self.jobs = {}
+            self.last_rows = []
 
     def enqueue(self, raw: str) -> str:
         job_id = uuid4().hex
@@ -363,7 +454,11 @@ class ValidatorApplication:
                 "started": False,
                 "skip_deferred": False,
                 "deferred_phones": [],
+                "results_by_phone": {},
+                "started_at": None,
+                "eta_seconds": None,
             }
+            self._save_locked()
         return job_id
 
     def start(self, job_id: str) -> bool:
@@ -371,8 +466,15 @@ class ValidatorApplication:
             job = self.jobs.get(job_id)
             if not job or job["complete"] or job["started"]:
                 return False
-            job.update(started=True, message="Задача ожидает свободный аккаунт Telegram.")
+            job.update(
+                started=True,
+                skip_deferred=False,
+                started_at=time.time(),
+                eta_seconds=None,
+                message="Задача ожидает свободный аккаунт Telegram.",
+            )
             raw = job["raw"]
+            self._save_locked()
         Thread(target=self._run_job, args=(job_id, raw), daemon=True).start()
         return True
 
@@ -385,6 +487,7 @@ class ValidatorApplication:
                 skip_deferred=True,
                 message="Отложенные контакты будут сняты с обработки после текущего пакета.",
             )
+            self._save_locked()
         return True
 
     def snapshot(self, job_id: str) -> dict | None:
@@ -394,11 +497,18 @@ class ValidatorApplication:
 
     def _update_job(self, job_id: str, **updates) -> None:
         with self._state_lock:
-            self.jobs[job_id].update(updates)
+            job = self.jobs[job_id]
+            job.update(updates)
+            processed = job.get("processed", 0)
+            if job.get("started_at") and processed:
+                elapsed = time.time() - job["started_at"]
+                job["eta_seconds"] = round(elapsed / processed * (job["total"] - processed))
+            self._save_locked()
 
     def _run_job(self, job_id: str, raw: str) -> None:
         with self._worker_lock:
             self._update_job(job_id, message="Проверка запущена.")
+            initial_results = self.snapshot(job_id)["results_by_phone"]
             def skip_deferred() -> bool:
                 with self._state_lock:
                     return self.jobs[job_id]["skip_deferred"]
@@ -414,6 +524,10 @@ class ValidatorApplication:
                             skip_deferred=skip_deferred,
                             deferred=lambda phones: self._update_job(
                                 job_id, deferred_phones=phones
+                            ),
+                            initial_results=initial_results,
+                            checkpoint=lambda results: self._update_job(
+                                job_id, results_by_phone=results
                             ),
                         )
                     )
@@ -435,9 +549,14 @@ class ValidatorApplication:
                 return
             with self._state_lock:
                 self.jobs[job_id].update(
-                    rows=rows, processed=len(rows), complete=True, message="Готово."
+                    rows=rows,
+                    processed=len(rows),
+                    complete=True,
+                    eta_seconds=0,
+                    message="Готово.",
                 )
                 self.last_rows = rows
+                self._save_locked()
 
     def handler(self):
         application = self
@@ -464,6 +583,17 @@ class ValidatorApplication:
                     job = application.snapshot(job_id) if job_id else None
                     rows = job["rows"] if job else application.last_rows
                     self.send_content(rows_to_csv(rows), "text/csv; charset=utf-8")
+                    return
+                if parsed.path == "/deferred.csv":
+                    job_id = parse_qs(parsed.query).get("job", [""])[0]
+                    job = application.snapshot(job_id)
+                    if not job:
+                        self.send_error(404)
+                        return
+                    self.send_content(
+                        rows_to_csv(deferred_rows(job["raw"], job["deferred_phones"])),
+                        "text/csv; charset=utf-8",
+                    )
                     return
                 if parsed.path.startswith("/jobs/"):
                     job = application.snapshot(parsed.path.removeprefix("/jobs/"))
@@ -525,7 +655,9 @@ def get_port() -> int:
 
 def main() -> None:
     port = get_port()
-    server = create_server(ValidatorApplication(), port=port)
+    server = create_server(
+        ValidatorApplication(state_path=Path(".validator-jobs.json")), port=port
+    )
     print(f"Откройте http://127.0.0.1:{port}")
     try:
         server.serve_forever()
