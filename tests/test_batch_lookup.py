@@ -27,6 +27,21 @@ class ImportedContactsResponse:
         ]
 
 
+class ResolvedPeerResponse:
+    def __init__(self):
+        self.users = [
+            types.User(
+                id=202,
+                access_hash=2,
+                first_name="Проверенный",
+                last_name="Контакт",
+                username=None,
+                phone="79991234567",
+                status=types.UserStatusRecently(),
+            )
+        ]
+
+
 class FakeClient:
     def __init__(self):
         self.imported_contacts = None
@@ -39,6 +54,14 @@ class FakeClient:
         if isinstance(request, main.functions.contacts.DeleteContactsRequest):
             self.deleted_contact_ids = request.id
             return None
+        raise AssertionError(f"Unexpected request: {request}")
+
+
+class ResolvePhoneClient:
+    async def __call__(self, request):
+        if isinstance(request, main.functions.contacts.ResolvePhoneRequest):
+            assert request.phone == "+79991234567"
+            return ResolvedPeerResponse()
         raise AssertionError(f"Unexpected request: {request}")
 
 
@@ -56,3 +79,21 @@ def test_batch_lookup_imports_many_phones_once_and_cleans_found_contacts():
     assert results["+79991234567"]["username"] == "test_user"
     assert results["+79990000000"]["error"].startswith("No response")
     assert client.deleted_contact_ids == [101]
+
+
+def test_resolve_phone_returns_found_account_without_importing_contact():
+    result = asyncio.run(main.resolve_phone(ResolvePhoneClient(), "+79991234567"))
+
+    assert result == {
+        "id": 202,
+        "username": None,
+        "usernames": None,
+        "first_name": "Проверенный",
+        "last_name": "Контакт",
+        "fake": None,
+        "verified": None,
+        "premium": None,
+        "mutual_contact": None,
+        "bot": None,
+        "bot_chat_history": None,
+    }

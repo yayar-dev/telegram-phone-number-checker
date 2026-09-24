@@ -39,6 +39,7 @@ ROW_FIELDS = (
 )
 BATCH_SIZE = 10
 BATCH_PAUSE_SECONDS = 1
+RESOLVE_PHONE_PAUSE_SECONDS = 3.1
 RETRY_CONTACT_PAUSE_SECONDS = 60
 MAX_RETRY_CONTACT_PAUSE_SECONDS = 600
 MAX_DEFERRED_RETRY_ATTEMPTS = 3
@@ -175,6 +176,68 @@ async def _check_phone_batch(
                         }
                     )
 
+            async def resolve_deferred_batches(batches) -> None:
+                """Resolve retry_contacts one by one without another contact import."""
+                phones_to_resolve = [phone for batch, _ in batches for phone in batch]
+                report_deferred(phones_to_resolve)
+                report(
+                    sum(
+                        1
+                        for entry in entries
+                        if entry["phone"] in results_by_phone or not is_valid_phone(entry["phone"])
+                    ),
+                    (
+                        f"Telegram отложил {len(phones_to_resolve)} контактов. "
+                        "Проверяем их по одному без импорта контактов."
+                    ),
+                )
+                for index, phone in enumerate(phones_to_resolve):
+                    if skip_deferred and skip_deferred():
+                        skip_batches(
+                            [(phones_to_resolve[index:], 0)],
+                            error="Проверка отложена пользователем.",
+                        )
+                        save_checkpoint()
+                        return
+                    while True:
+                        try:
+                            results_by_phone[phone] = await upstream.resolve_phone(client, phone)
+                            save_checkpoint()
+                            break
+                        except FloodWaitError as error:
+                            seconds = max(1, int(error.seconds))
+                            report(
+                                sum(
+                                    1
+                                    for entry in entries
+                                    if entry["phone"] in results_by_phone
+                                    or not is_valid_phone(entry["phone"])
+                                ),
+                                (
+                                    "Telegram ограничил прямую проверку. "
+                                    f"Ждём {seconds} сек. и продолжим с этого номера."
+                                ),
+                            )
+                            await asyncio.sleep(seconds + 1)
+                        except Exception as error:
+                            results_by_phone[phone] = {"error": str(error)}
+                            save_checkpoint()
+                            break
+                    report_deferred(phones_to_resolve[index + 1 :])
+                    report(
+                        sum(
+                            1
+                            for entry in entries
+                            if entry["phone"] in results_by_phone or not is_valid_phone(entry["phone"])
+                        ),
+                        (
+                            f"Прямая проверка отложенных: {index + 1} из "
+                            f"{len(phones_to_resolve)}."
+                        ),
+                    )
+                    if index + 1 < len(phones_to_resolve):
+                        await asyncio.sleep(RESOLVE_PHONE_PAUSE_SECONDS)
+
             while pending_batches or deferred_batches:
                 if pending_batches:
                     phones, retry_attempt = pending_batches.popleft()
@@ -196,59 +259,7 @@ async def _check_phone_batch(
                         break
                     batches_to_retry = deque(deferred_batches)
                     deferred_batches.clear()
-                    retry_attempt = max(attempt for _, attempt in batches_to_retry)
-                    if retry_attempt >= MAX_DEFERRED_RETRY_ATTEMPTS:
-                        skip_batches(
-                            batches_to_retry,
-                            error=(
-                                "Telegram повторно отложил контакт после нескольких попыток. "
-                                "Повторите проверку позже."
-                            ),
-                        )
-                        save_checkpoint()
-                        report_deferred([phone for batch, _ in batches_to_retry for phone in batch])
-                        report(
-                            sum(
-                                1
-                                for entry in entries
-                                if entry["phone"] in results_by_phone
-                                or not is_valid_phone(entry["phone"])
-                            ),
-                            "Telegram не принял отложенные контакты после 3 попыток. Они помечены для повторной проверки позже.",
-                        )
-                        break
-                    wait_seconds = min(
-                        RETRY_CONTACT_PAUSE_SECONDS * 2 ** (retry_attempt - 1),
-                        MAX_RETRY_CONTACT_PAUSE_SECONDS,
-                    )
-                    retry_count = sum(len(batch) for batch, _ in batches_to_retry)
-                    report(
-                        sum(
-                            1
-                            for entry in entries
-                            if entry["phone"] in results_by_phone
-                            or not is_valid_phone(entry["phone"])
-                        ),
-                        f"Telegram отложил {retry_count} контактов. Повтор № {retry_attempt} через {wait_seconds} сек.",
-                    )
-                    report_deferred(
-                        [phone for batch, _ in batches_to_retry for phone in batch]
-                    )
-                    if not await wait_for_deferred(wait_seconds):
-                        skip_batches(batches_to_retry)
-                        save_checkpoint()
-                        report_deferred()
-                        report(
-                            sum(
-                                1
-                                for entry in entries
-                                if entry["phone"] in results_by_phone
-                                or not is_valid_phone(entry["phone"])
-                            ),
-                            "Отложенные контакты сняты с обработки.",
-                        )
-                        break
-                    pending_batches.extend(batches_to_retry)
+                    await resolve_deferred_batches(batches_to_retry)
                     report_deferred()
                     continue
                 while True:
@@ -266,13 +277,6 @@ async def _check_phone_batch(
                         )
                         save_checkpoint()
                         if retry_phones:
-                            if len(retry_phones) == len(phones) and schedule_later:
-                                schedule_later(
-                                    retry_phones
-                                    + [phone for batch, _ in pending_batches for phone in batch]
-                                    + [phone for batch, _ in deferred_batches for phone in batch]
-                                )
-                                raise RetryLater
                             deferred_batches.append((retry_phones, retry_attempt + 1))
                             report_deferred()
                             report(

@@ -138,6 +138,37 @@ async def get_names(
     return result
 
 
+async def resolve_phone(client: TelegramClient, phone_number: str) -> dict:
+    """Resolve one phone without adding it to the local Telegram contacts."""
+    try:
+        resolved = await client(functions.contacts.ResolvePhoneRequest(phone_number))
+    except (errors.PhoneNotOccupiedError, errors.UserPrivacyRestrictedError):
+        return {
+            "error": "No response, the phone number is not on Telegram or has blocked phone lookup."
+        }
+
+    user = next(iter(resolved.users), None)
+    if user is None:
+        return {
+            "error": "No response, the phone number is not on Telegram or has blocked phone lookup."
+        }
+    return {
+        "id": user.id,
+        "username": user.username,
+        "usernames": [u.username for u in (user.usernames or [])]
+        if user.usernames
+        else None,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "fake": user.fake,
+        "verified": user.verified,
+        "premium": user.premium,
+        "mutual_contact": user.mutual_contact,
+        "bot": user.bot,
+        "bot_chat_history": user.bot_chat_history,
+    }
+
+
 async def get_names_batch(client: TelegramClient, phone_numbers: list[str]) -> dict[str, dict]:
     """Check a small phone-number batch with one contacts.importContacts request."""
     contacts = [
