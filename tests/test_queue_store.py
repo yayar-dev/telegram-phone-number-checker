@@ -199,3 +199,23 @@ def test_malformed_json_keeps_source_and_enters_diagnostic_mode(tmp_path):
     assert source.read_text(encoding="utf-8") == "{bad json"
     assert diagnostic["active"] is True
     assert "не удалось" in diagnostic["message"].lower()
+
+
+def test_manual_chat_confirmation_keeps_api_status_and_adds_phone_link(tmp_path):
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("+79089145093")
+    store.start(job_id)
+    claim = store.claim_next("worker-a")
+    store.finish_claim(claim, {"error": "No response, the phone number is not on Telegram or has blocked phone lookup."})
+
+    before = store.rows(job_id)[0]
+    assert before["api_status"] == "UNRESOLVABLE_OR_PRIVACY"
+    assert before["manual_confirmation"] == "NOT_CONFIRMED"
+    assert before["telegram_link"] == "https://t.me/+79089145093?profile"
+
+    assert store.confirm_manual_chat(job_id, before["_item_id"]) is True
+
+    after = store.rows(job_id)[0]
+    assert after["status"] == "UNRESOLVABLE_OR_PRIVACY"
+    assert after["api_status"] == "UNRESOLVABLE_OR_PRIVACY"
+    assert after["manual_confirmation"] == "MANUAL_CHAT_CONFIRMED"

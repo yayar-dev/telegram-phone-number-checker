@@ -71,6 +71,8 @@ class QueueStore:
                 next_attempt_at REAL, lease_owner TEXT, lease_expires_at REAL,
                 telegram_id TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '',
                 name TEXT NOT NULL DEFAULT '', telegram_link TEXT NOT NULL DEFAULT '',
+                api_status TEXT NOT NULL DEFAULT '', manual_confirmation TEXT NOT NULL DEFAULT 'NOT_CONFIRMED',
+                manual_confirmed_at REAL,
                 started_at REAL, completed_at REAL, UNIQUE(job_id, ordinal)
             );
             CREATE TABLE IF NOT EXISTS job_events (
@@ -105,6 +107,15 @@ class QueueStore:
             connection.execute("ALTER TABLE contact_cleanup ADD COLUMN lease_owner TEXT")
         if "lease_expires_at" not in cleanup_columns:
             connection.execute("ALTER TABLE contact_cleanup ADD COLUMN lease_expires_at REAL")
+        item_columns = {row["name"] for row in connection.execute("PRAGMA table_info(job_items)").fetchall()}
+        if "api_status" not in item_columns:
+            connection.execute("ALTER TABLE job_items ADD COLUMN api_status TEXT NOT NULL DEFAULT ''")
+        if "manual_confirmation" not in item_columns:
+            connection.execute(
+                "ALTER TABLE job_items ADD COLUMN manual_confirmation TEXT NOT NULL DEFAULT 'NOT_CONFIRMED'"
+            )
+        if "manual_confirmed_at" not in item_columns:
+            connection.execute("ALTER TABLE job_items ADD COLUMN manual_confirmed_at REAL")
 
     def create_job(self, raw: str) -> str:
         job_id = uuid4().hex
@@ -303,13 +314,46 @@ class QueueStore:
                     "name": item["name"], "telegram_link": item["telegram_link"], "detail": item["detail"],
                 }
             else:
+                phone_link = (
+                    f"https://t.me/+{item['normalized_phone'].lstrip('+')}?profile"
+                    if status == "UNRESOLVABLE_OR_PRIVACY" and is_valid_phone(item["normalized_phone"])
+                    else ""
+                )
                 rendered = {
                     "phone": item["normalized_phone"], "status": status,
-                    "telegram_id": "", "username": "", "name": "", "telegram_link": "",
+                    "telegram_id": "", "username": "", "name": "", "telegram_link": phone_link,
                     "detail": item["detail"],
                 }
-            rows.append({"company_name": item["company_name"], "company_link": item["company_link"], **rendered})
+            rows.append(
+                {
+                    "_item_id": str(item["id"]),
+                    "company_name": item["company_name"], "company_link": item["company_link"],
+                    "api_status": item["api_status"] or status,
+                    "manual_confirmation": item["manual_confirmation"] or "NOT_CONFIRMED",
+                    **rendered,
+                }
+            )
         return rows
+
+    def confirm_manual_chat(self, job_id: str, item_id: str) -> bool:
+        """Record an operator's observed chat opening without rewriting API evidence."""
+        try:
+            parsed_item_id = int(item_id)
+        except (TypeError, ValueError):
+            return False
+        timestamp = self.now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """UPDATE job_items SET manual_confirmation = 'MANUAL_CHAT_CONFIRMED',
+                   manual_confirmed_at = ? WHERE id = ? AND job_id = ?
+                   AND status = 'UNRESOLVABLE_OR_PRIVACY'""",
+                (timestamp, parsed_item_id, job_id),
+            ).rowcount
+            if changed:
+                self._event(connection, job_id, "MANUAL_CHAT_CONFIRMED", "Оператор подтвердил открытие чата.")
+            connection.commit()
+            return bool(changed)
 
     def _reconcile_connection(self, connection: sqlite3.Connection, timestamp: float) -> None:
         """Release only expired leases and wake elapsed rate-limit waits."""

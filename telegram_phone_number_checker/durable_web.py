@@ -121,6 +121,9 @@ class DurableValidatorApplication:
         self.store.cancel(job_id)
         return True
 
+    def confirm_manual_chat(self, job_id: str, item_id: str) -> bool:
+        return self.store.confirm_manual_chat(job_id, item_id)
+
     def handler(self):
         application = self
 
@@ -172,6 +175,12 @@ class DurableValidatorApplication:
                     self.redirect(f"/jobs/{application.enqueue(values.get('phone_numbers', [''])[0])}")
                     return
                 parts = path.removeprefix("/jobs/").split("/")
+                if len(parts) == 3 and parts[1] == "confirm":
+                    if application.confirm_manual_chat(parts[0], parts[2]):
+                        self.redirect(f"/jobs/{parts[0]}")
+                        return
+                    self.send_error(404)
+                    return
                 if len(parts) != 2 or not parts[0]:
                     self.send_error(404)
                     return
@@ -289,16 +298,22 @@ def _render_results(rows: list[dict[str, str]], processed: int, total: int, job_
     if not rows:
         return ""
     headers = "".join(f"<th>{html.escape(field)}</th>" for field in web.ROW_FIELDS)
+    def cell(row: dict[str, str], field: str) -> str:
+        value = row.get(field, "")
+        if field in {"company_link", "telegram_link"} and value:
+            return f'<td><a href="{html.escape(value, quote=True)}" target="_blank" rel="noreferrer">{html.escape(value)}</a></td>'
+        if field == "manual_confirmation" and row.get("status") == "UNRESOLVABLE_OR_PRIVACY":
+            if value == "MANUAL_CHAT_CONFIRMED":
+                return f"<td>{html.escape(value)}</td>"
+            return (
+                f"<td>{html.escape(value)} "
+                f'<form class="action" method="post" action="/jobs/{html.escape(job_id, quote=True)}/confirm/{html.escape(row["_item_id"], quote=True)}">'
+                '<button type="submit">Подтвердить вручную</button></form></td>'
+            )
+        return f"<td>{html.escape(value)}</td>"
+
     body = "".join(
-        "<tr>"
-        + "".join(
-            f"<td>{html.escape(row.get(field, ''))}</td>"
-            if field not in {"company_link", "telegram_link"} or not row.get(field)
-            else f'<td><a href="{html.escape(row[field], quote=True)}" target="_blank" rel="noreferrer">{html.escape(row[field])}</a></td>'
-            for field in web.ROW_FIELDS
-        )
-        + "</tr>"
-        for row in rows
+        "<tr>" + "".join(cell(row, field) for field in web.ROW_FIELDS) + "</tr>" for row in rows
     )
     return (
         f"<p class=\"hint\">Показаны текущие строки: {processed} завершено из {total}.</p>"

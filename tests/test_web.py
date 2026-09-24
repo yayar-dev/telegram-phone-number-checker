@@ -8,6 +8,7 @@ import pytest
 
 from telegram_phone_number_checker import web
 from telegram_phone_number_checker.durable_web import DurableValidatorApplication, TelethonGateway
+from telegram_phone_number_checker.queue_store import QueueStore
 
 
 class _BlockingGateway:
@@ -133,6 +134,22 @@ def test_durable_home_page_lists_a_staged_queue(tmp_path):
     assert f'href="/jobs/{job_id}"' in page
     assert "Сохранённые очереди" in page
     assert "STAGED" in page
+
+
+def test_durable_job_shows_manual_confirmation_for_privacy_limited_row(tmp_path):
+    database = tmp_path / "validator.db"
+    store = QueueStore(database)
+    job_id = store.create_job("+79089145093")
+    store.start(job_id)
+    claim = store.claim_next("worker-a")
+    store.finish_claim(claim, {"error": "No response, the phone number is not on Telegram or has blocked phone lookup."})
+    app = DurableValidatorApplication(database)
+
+    page = app.render_job_page(job_id)
+
+    assert "https://t.me/+79089145093?profile" in page
+    assert f'action="/jobs/{job_id}/confirm/' in page
+    assert "Подтвердить вручную" in page
 
 
 def test_web_uses_one_batch_lookup_for_valid_phone_numbers(monkeypatch):

@@ -31,6 +31,8 @@ ROW_FIELDS = (
     "company_link",
     "phone",
     "status",
+    "api_status",
+    "manual_confirmation",
     "telegram_id",
     "username",
     "name",
