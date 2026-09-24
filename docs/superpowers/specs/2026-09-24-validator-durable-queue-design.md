@@ -65,6 +65,7 @@ is introduced.
   `company_link`);
 - `raw_phone`, `normalized_phone`;
 - `status`, `method`, `detail`, `attempts`, `next_attempt_at`;
+- `lease_owner`, `lease_expires_at` for an in-flight request;
 - Telegram fields (`telegram_id`, `username`, `name`, `telegram_link`);
 - `started_at`, `completed_at`.
 
@@ -77,6 +78,14 @@ is introduced.
 - one row for the configured account: `account_key`, `lease_owner`,
   `lease_expires_at`, `next_import_at`, `next_direct_lookup_at`,
   `next_available_at`, `updated_at`.
+
+`contact_cleanup`
+
+- `id`, `job_id`, `telegram_user_id`, `state`, `attempts`,
+  `next_attempt_at`, `last_error`, `created_at`, `completed_at`;
+- uniqueness on `(job_id, telegram_user_id)`. Cleanup is independent of the
+  validation item state: a failed delete never downgrades `FOUND` and never
+  schedules another import for the same phone.
 
 `schema_meta`
 
@@ -92,7 +101,8 @@ The connection sets `PRAGMA journal_mode=WAL`, `foreign_keys=ON`,
 and renews the account lease using `BEGIN IMMEDIATE`. A second service process
 cannot use the same Telegram session until that lease expires. Short database
 transactions never contain network activity. The schema has indexes for ready
-items and retry times.
+items, retry times and expired item leases. `jobs` also has `run_lease_owner`
+and `run_lease_expires_at` so a stale `RUNNING` state is recoverable.
 
 ## State transitions
 
@@ -121,6 +131,12 @@ but before saving its reply can cause one repeat after recovery. Exactly-once
 external delivery is therefore not promised, and no repeated item becomes a
 negative result solely for that reason.
 
+At startup and before every scheduler claim, one reconciliation transaction
+releases an expired account lease, reclaims expired item leases, and converts a
+stale `RUNNING` job to `WAITING_RATE_LIMIT` when `resume_after` is still in the
+future or `QUEUED` otherwise. The scheduler claims it normally without a
+browser action. A non-expired lease is never reclaimed by another process.
+
 ## Single-account worker
 
 One durable worker owns the configured Telegram session and claims ready work
@@ -143,10 +159,11 @@ and global timing ledger apply to every job, including after a restart.
    account, including other jobs. The scheduler resumes automatically after
    it. Waiting is wakeable, so pause or cancel takes effect without waiting for
    the full FloodWait timer.
-6. Every successful import records imported contact IDs. A `finally`-style
-   cleanup sends `DeleteContactsRequest`; cleanup failures are visible events
-   and enter `RETRYABLE_ERROR`, so interrupted runs do not silently leave
-   contacts in the operator's address book.
+6. Every successful import records imported contact IDs as `contact_cleanup`
+   work. `DeleteContactsRequest` marks that work done; a cleanup failure is a
+   visible retryable cleanup event, so interrupted runs do not silently leave
+   contacts in the operator's address book. It cannot change a completed
+   validation status or trigger import.
 
 The import batch starts at ten and may reduce to five, then one after an import
 batch returns any `retry_contacts`; the reduction applies only to later,
@@ -162,12 +179,29 @@ that result. Cancel does the same, then atomically labels all remaining
 
 On first start the application detects `.validator-jobs.json` and imports each
 saved job in one transaction. Existing result maps, including completed rows
-from the current 1,010-number job, become final item rows. Deferred or
-unprocessed rows become `PENDING` for direct lookup. Rows intentionally stopped
-by the user (`skip_deferred`) become `DEFERRED_NOT_CHECKED` and are never
-automatically resumed. Every original input ordinal becomes exactly one item
-row. The JSON source is kept unchanged and migration is recorded as
+from the current 1,010-number job, become final item rows. Deferred rows become
+`PENDING` for direct lookup and otherwise unprocessed rows become `PENDING` for
+import. Rows intentionally stopped by the user (`skip_deferred`) become
+`DEFERRED_NOT_CHECKED` and are never automatically resumed. Every original
+input ordinal becomes exactly one item row. The JSON source is kept unchanged
+and migration is recorded as
 `JSON_MIGRATED` with its checksum.
+
+Migration uses the following precedence for every original ordinal:
+
+| Source condition | Migrated item state and method |
+| --- | --- |
+| invalid normalized phone | `INVALID_PHONE`, no Telegram method |
+| `results_by_phone[phone].skipped` or `skip_deferred` plus deferred phone | `DEFERRED_NOT_CHECKED`, no automatic retry |
+| stored successful `id` | `FOUND` or `FOUND_NO_USERNAME`, preserving Telegram fields |
+| stored `No response` / privacy result | `UNRESOLVABLE_OR_PRIVACY` |
+| stored `retry: true`, retry message, or deferred phone | `PENDING`, `DIRECT_LOOKUP` |
+| stored FloodWait / `waiting_until` without a final item result | `PENDING`, method selected from the prior phase; job keeps `resume_after` |
+| stored generic error | `RETRYABLE_ERROR`, with an immediate first retry |
+| no stored result | `PENDING`, `IMPORT` |
+
+The first matching row wins in that order. A job with `waiting_until` starts as
+`WAITING_RATE_LIMIT` until that timestamp; otherwise it starts as `QUEUED`.
 
 `schema_meta` versioning and source checksums make migration idempotent. If
 migration or JSON parsing fails, the service does not delete or overwrite JSON
