@@ -40,8 +40,9 @@ The job page adds only operational detail:
 - `Пауза`, `Продолжить`, and `Отменить` controls; cancellation preserves all
   completed rows and labels untouched rows `CANCELLED`.
 
-Results are exported at any time. A partial CSV includes every input row, its
-current status and the selected validation method.
+Results are exported at any time directly from `job_items`. The page table and
+partial CSV include every input row, including duplicates under different
+companies, with its current status, selected validation method and reason.
 
 ## State model
 
@@ -71,9 +72,27 @@ is introduced.
 
 - `id`, `job_id`, `created_at`, `kind`, `message`, `processed`, `total`.
 
+`worker_state`
+
+- one row for the configured account: `account_key`, `lease_owner`,
+  `lease_expires_at`, `next_import_at`, `next_direct_lookup_at`,
+  `next_available_at`, `updated_at`.
+
+`schema_meta`
+
+- `schema_version` and migration markers, including the checksum of a migrated
+  JSON source.
+
 `ordinal` is unique within a job. Several company rows may refer to the same
 normalized phone; the worker performs one lookup and atomically applies its
 outcome to every still-pending matching row.
+
+The connection sets `PRAGMA journal_mode=WAL`, `foreign_keys=ON`,
+`synchronous=FULL`, and `busy_timeout`. Before each claim, a process acquires
+and renews the account lease using `BEGIN IMMEDIATE`. A second service process
+cannot use the same Telegram session until that lease expires. Short database
+transactions never contain network activity. The schema has indexes for ready
+items and retry times.
 
 ## State transitions
 
@@ -81,19 +100,32 @@ Job states are `QUEUED`, `RUNNING`, `WAITING_RATE_LIMIT`, `PAUSED`,
 `CANCELLED`, `COMPLETED`, and `FAILED`.
 
 An item is `PENDING`, `IN_PROGRESS`, `FOUND`, `FOUND_NO_USERNAME`,
-`UNRESOLVABLE_OR_PRIVACY`, `INVALID_PHONE`, `API_ERROR`, or `CANCELLED`.
-Only the final item states contribute to completed progress.
+`UNRESOLVABLE_OR_PRIVACY`, `INVALID_PHONE`, `RETRYABLE_ERROR`,
+`API_ERROR_FINAL`, `DEFERRED_NOT_CHECKED`, or `CANCELLED`. Only
+`FOUND`, `FOUND_NO_USERNAME`, `UNRESOLVABLE_OR_PRIVACY`, `INVALID_PHONE`,
+`API_ERROR_FINAL`, `DEFERRED_NOT_CHECKED`, and `CANCELLED` contribute to
+completed progress. The page reports both processed rows and confirmed
+accounts; an inconclusive row is never presented as a missing account.
+
+Temporary network/RPC errors enter `RETRYABLE_ERROR` with retry times of 30,
+120 and 600 seconds. After three failures they become `API_ERROR_FINAL`.
+`FloodWait` is not an error attempt: its server-supplied delay puts the account
+and the affected job into `WAITING_RATE_LIMIT`.
 
 Every state mutation is committed in one SQLite transaction. Before a request,
-the worker marks its item set `IN_PROGRESS`; after a reply it persists results
-and an event in the same transaction. On restart, unfinished `IN_PROGRESS`
-items return to `PENDING`, never to a negative status. This makes a crash or
-browser close recoverable.
+the worker persists `IN_PROGRESS`, its item lease, and the next allowed request
+time; after a reply it persists results and an event in one transaction. On
+restart, only expired unfinished item leases return to `PENDING`, increment
+their attempt count and add a recovery event. A crash after sending a request
+but before saving its reply can cause one repeat after recovery. Exactly-once
+external delivery is therefore not promised, and no repeated item becomes a
+negative result solely for that reason.
 
 ## Single-account worker
 
 One durable worker owns the configured Telegram session and claims ready work
-from SQLite. It never issues simultaneous Telegram requests.
+from SQLite. It never issues simultaneous Telegram requests. Its account lease
+and global timing ledger apply to every job, including after a restart.
 
 1. It takes up to ten unique `PENDING` valid numbers and calls
    `contacts.importContacts`.
@@ -106,25 +138,41 @@ from SQLite. It never issues simultaneous Telegram requests.
    least 3.1 seconds between calls. A positive response becomes `FOUND` or
    `FOUND_NO_USERNAME`; `PHONE_NOT_OCCUPIED` remains
    `UNRESOLVABLE_OR_PRIVACY` because Telegram uses it for private lookups too.
-5. A `FloodWait` stores `WAITING_RATE_LIMIT` and the exact `resume_after`
-   timestamp. The scheduler resumes automatically after it. Pause or cancel
-   is checked before every request and while waiting.
+5. A `FloodWait` stores `WAITING_RATE_LIMIT`, the exact `resume_after`, and
+   `worker_state.next_available_at`. It blocks all Telegram requests for the
+   account, including other jobs. The scheduler resumes automatically after
+   it. Waiting is wakeable, so pause or cancel takes effect without waiting for
+   the full FloodWait timer.
+6. Every successful import records imported contact IDs. A `finally`-style
+   cleanup sends `DeleteContactsRequest`; cleanup failures are visible events
+   and enter `RETRYABLE_ERROR`, so interrupted runs do not silently leave
+   contacts in the operator's address book.
 
-The import batch starts at ten and may reduce to five, then one, only after
-server retry signals. It never increases above ten. This improves the chance
-of completing the import phase while respecting the observed safe batch size.
+The import batch starts at ten and may reduce to five, then one after an import
+batch returns any `retry_contacts`; the reduction applies only to later,
+untouched import candidates and resets to ten for the next job. Returned
+`retry_contacts` always use direct lookup and are never re-imported. The batch
+size never increases above ten.
+
+Pause stops new requests after the currently sent request returns and preserves
+that result. Cancel does the same, then atomically labels all remaining
+`PENDING`, expired `IN_PROGRESS`, and `RETRYABLE_ERROR` rows `CANCELLED`.
 
 ## Migration and recovery
 
 On first start the application detects `.validator-jobs.json` and imports each
-saved job into SQLite. Existing result maps, including completed rows from the
-current 1,010-number job, are translated into final item rows. Deferred or
-unprocessed rows become `PENDING` for direct lookup. The JSON source is kept
-unchanged as a backup and migration is recorded in `job_events`.
+saved job in one transaction. Existing result maps, including completed rows
+from the current 1,010-number job, become final item rows. Deferred or
+unprocessed rows become `PENDING` for direct lookup. Rows intentionally stopped
+by the user (`skip_deferred`) become `DEFERRED_NOT_CHECKED` and are never
+automatically resumed. Every original input ordinal becomes exactly one item
+row. The JSON source is kept unchanged and migration is recorded as
+`JSON_MIGRATED` with its checksum.
 
-If migration fails, the service does not delete or overwrite JSON and starts
-with a visible configuration error. The database is backed up before every
-schema migration.
+`schema_meta` versioning and source checksums make migration idempotent. If
+migration or JSON parsing fails, the service does not delete or overwrite JSON
+and starts in a visible diagnostic mode without a worker. The database is
+backed up before every future schema migration.
 
 ## Security and retention
 
@@ -142,10 +190,18 @@ is not lost.
 Automated tests must cover:
 
 - migration of existing JSON with completed and deferred entries;
+- idempotent migration, `skip_deferred` preservation, and malformed JSON
+  diagnostic mode;
 - restart while importing, direct lookup and FloodWait;
+- process lease conflict, expired-lease recovery, and concurrent HTTP actions;
+- crash after claim and after simulated request reply;
+- persistent import/direct lookup limiter across restart and account-wide
+  FloodWait blocking;
 - no duplicate Telegram request for duplicate normalized phone values;
 - direct fallback for every `retry_contacts` item and a 3.1-second limiter;
-- pause, resume and cancel without losing completed results;
+- retryable error transition, bounded retries, and contact-cleanup failure;
+- pause, resume and cancel without losing completed results or issuing a new
+  request after the control is observed;
 - partial and final CSV preserving company context and all input rows;
 - HTTP smoke: explicit queue confirmation, queued job, start, progress,
   pause/resume/cancel and CSV endpoints.
