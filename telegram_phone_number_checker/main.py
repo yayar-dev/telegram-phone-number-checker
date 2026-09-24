@@ -169,8 +169,15 @@ async def resolve_phone(client: TelegramClient, phone_number: str) -> dict:
     }
 
 
-async def get_names_batch(client: TelegramClient, phone_numbers: list[str]) -> dict[str, dict]:
-    """Check a small phone-number batch with one contacts.importContacts request."""
+async def get_names_batch(
+    client: TelegramClient, phone_numbers: list[str], *, cleanup_contacts: bool = True
+) -> dict[str, dict]:
+    """Check a small phone-number batch with one contacts.importContacts request.
+
+    Durable callers pass ``cleanup_contacts=False`` so the worker can persist
+    cleanup work before issuing ``DeleteContactsRequest``. The interactive CLI
+    retains its immediate cleanup behaviour.
+    """
     contacts = [
         types.InputPhoneContact(
             client_id=index,
@@ -224,12 +231,20 @@ async def get_names_batch(client: TelegramClient, phone_numbers: list[str]) -> d
             "user_was_online": get_human_readable_user_status(user.status),
             "phone": user.phone,
         }
+        if not cleanup_contacts:
+            # Private worker metadata. It is intentionally not rendered or
+            # exported; QueueStore turns it into durable cleanup work.
+            results[phone_number]["_cleanup_contact_id"] = user_id
 
-    if imported_user_ids_to_delete:
-        await client(
-            functions.contacts.DeleteContactsRequest(id=imported_user_ids_to_delete)
-        )
+    if cleanup_contacts:
+        await cleanup_imported_contacts(client, imported_user_ids_to_delete)
     return results
+
+
+async def cleanup_imported_contacts(client: TelegramClient, user_ids: list[int]) -> None:
+    """Remove contacts imported by this validator request, if there are any."""
+    if user_ids:
+        await client(functions.contacts.DeleteContactsRequest(id=user_ids))
 
 
 async def get_user_by_username(
