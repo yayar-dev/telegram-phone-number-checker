@@ -4,6 +4,8 @@ import time
 from urllib.parse import urlencode
 import asyncio
 
+import pytest
+
 from telegram_phone_number_checker import web
 
 
@@ -268,6 +270,36 @@ def test_web_finishes_after_repeated_deferred_retries(monkeypatch):
     assert len(calls) == web.MAX_DEFERRED_RETRY_ATTEMPTS
     assert pauses == [web.RETRY_CONTACT_PAUSE_SECONDS, web.RETRY_CONTACT_PAUSE_SECONDS * 2]
     assert rows[0]["status"] == "DEFERRED_NOT_CHECKED"
+
+
+def test_web_schedules_a_later_run_when_an_entire_batch_is_deferred(monkeypatch):
+    scheduled = []
+
+    class Client:
+        async def disconnect(self):
+            return None
+
+    async def login(*args):
+        return Client()
+
+    async def get_names_batch(client, phones):
+        return {phone: {"retry": True, "error": "Retry later"} for phone in phones}
+
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
+    monkeypatch.setattr(web.upstream, "login", login)
+    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch, raising=False)
+
+    with pytest.raises(web.RetryLater):
+        asyncio.run(
+            web._check_phone_batch(
+                "+79991234567\n+79990000000",
+                schedule_later=lambda phones: scheduled.extend(phones),
+            )
+        )
+
+    assert scheduled == ["+79991234567", "+79990000000"]
 
 
 def test_web_splits_eleven_phones_into_batches_of_ten(monkeypatch):

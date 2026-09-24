@@ -42,10 +42,15 @@ BATCH_PAUSE_SECONDS = 1
 RETRY_CONTACT_PAUSE_SECONDS = 60
 MAX_RETRY_CONTACT_PAUSE_SECONDS = 600
 MAX_DEFERRED_RETRY_ATTEMPTS = 3
+RETRY_WINDOWS_SECONDS = (15 * 60, 60 * 60, 4 * 60 * 60, 12 * 60 * 60)
 
 
 class ConfigurationError(Exception):
     """Raised when the local Telegram credentials are not configured."""
+
+
+class RetryLater(Exception):
+    """Stop this run and let the durable scheduler retry after a cooldown."""
 
 
 def rows_to_csv(rows: list[dict[str, str]]) -> str:
@@ -93,6 +98,7 @@ async def _check_phone_batch(
     deferred: Callable[[list[str]], None] | None = None,
     initial_results: dict[str, dict] | None = None,
     checkpoint: Callable[[dict[str, dict]], None] | None = None,
+    schedule_later: Callable[[list[str]], None] | None = None,
 ) -> list[dict[str, str]]:
     missing = [name for name in ("API_ID", "API_HASH", "PHONE_NUMBER") if not os.getenv(name)]
     if missing:
@@ -260,6 +266,13 @@ async def _check_phone_batch(
                         )
                         save_checkpoint()
                         if retry_phones:
+                            if len(retry_phones) == len(phones) and schedule_later:
+                                schedule_later(
+                                    retry_phones
+                                    + [phone for batch, _ in pending_batches for phone in batch]
+                                    + [phone for batch, _ in deferred_batches for phone in batch]
+                                )
+                                raise RetryLater
                             deferred_batches.append((retry_phones, retry_attempt + 1))
                             report_deferred()
                             report(
@@ -272,6 +285,8 @@ async def _check_phone_batch(
                                 f"Telegram попросил повторить {len(retry_phones)} контактов. Продолжаем другие пакеты.",
                             )
                         break
+                    except RetryLater:
+                        raise
                     except FloodWaitError as error:
                         seconds = max(1, int(error.seconds))
                         report(
@@ -350,6 +365,14 @@ def render_page(
             rows = job["rows"]
             error = job["error"]
             download_url = f"/download.csv?job={job['id']}"
+        elif job.get("waiting_until"):
+            remaining = max(0, round(job["waiting_until"] - time.time()))
+            job_html = (
+                f"<p>Ожидание Telegram: следующая попытка через {remaining // 60} мин. {remaining % 60} сек.</p>"
+                f"<p class=\"hint\">{html.escape(job['message'])}</p>"
+                f'<p><a href="/deferred.csv?job={job["id"]}">Скачать отложенные CSV</a></p>'
+            )
+            refresh_html = '<meta http-equiv="refresh" content="10">'
         elif not job.get("started", False):
             job_html = (
                 f"<p>В очереди: 0 из {job['total']}. Список сохранён и готов к проверке.</p>"
@@ -426,6 +449,24 @@ class ValidatorApplication:
         self._state_lock = Lock()
         self._worker_lock = Lock()
         self._load_state()
+        if self.state_path:
+            Thread(target=self._scheduler_loop, daemon=True).start()
+
+    def _scheduler_loop(self) -> None:
+        while True:
+            time.sleep(5)
+            now = time.time()
+            with self._state_lock:
+                due = [
+                    job_id
+                    for job_id, job in self.jobs.items()
+                    if not job["complete"]
+                    and not job["started"]
+                    and job.get("waiting_until")
+                    and job["waiting_until"] <= now
+                ]
+            for job_id in due:
+                self.start(job_id)
 
     def _save_locked(self) -> None:
         if not self.state_path:
@@ -450,6 +491,8 @@ class ValidatorApplication:
                 job.setdefault("skip_deferred", False)
                 job.setdefault("started", False)
                 job.setdefault("complete", False)
+                job.setdefault("waiting_until", None)
+                job.setdefault("retry_round", 0)
                 if job["started"] and not job["complete"]:
                     job.update(
                         started=False,
@@ -478,6 +521,8 @@ class ValidatorApplication:
                 "results_by_phone": {},
                 "started_at": None,
                 "eta_seconds": None,
+                "waiting_until": None,
+                "retry_round": 0,
             }
             self._save_locked()
         return job_id
@@ -490,6 +535,7 @@ class ValidatorApplication:
             job.update(
                 started=True,
                 skip_deferred=False,
+                waiting_until=None,
                 started_at=time.time(),
                 eta_seconds=None,
                 message="Задача ожидает свободный аккаунт Telegram.",
@@ -550,10 +596,29 @@ class ValidatorApplication:
                             checkpoint=lambda results: self._update_job(
                                 job_id, results_by_phone=results
                             ),
+                            schedule_later=lambda phones: self._update_job(
+                                job_id, deferred_phones=phones
+                            ),
                         )
                     )
                 else:
                     rows = self.check_batch(raw)
+            except RetryLater:
+                with self._state_lock:
+                    job = self.jobs[job_id]
+                    retry_round = job.get("retry_round", 0) + 1
+                    delay = RETRY_WINDOWS_SECONDS[min(retry_round - 1, len(RETRY_WINDOWS_SECONDS) - 1)]
+                    job.update(
+                        started=False,
+                        retry_round=retry_round,
+                        waiting_until=time.time() + delay,
+                        message=(
+                            "Telegram временно отложил оставшиеся контакты. "
+                            f"Следующая автоматическая попытка через {delay // 60} мин."
+                        ),
+                    )
+                    self._save_locked()
+                return
             except ConfigurationError as error:
                 self._update_job(job_id, error=str(error), complete=True, message="Не настроено.")
                 return
