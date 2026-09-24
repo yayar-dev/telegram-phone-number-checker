@@ -22,7 +22,7 @@ def normalize_phone_line(line: str) -> str:
     return f"+{digits}" if stripped.startswith("+") else stripped
 
 
-def parse_company_phone_batch(raw: str) -> list[dict[str, str]]:
+def parse_company_phone_batch(raw: str, deduplicate: bool = True) -> list[dict[str, str]]:
     """Parse optional Markdown company headers and their following phone numbers."""
     rows: list[dict[str, str]] = []
     company_name = ""
@@ -43,7 +43,7 @@ def parse_company_phone_batch(raw: str) -> list[dict[str, str]]:
             continue
         phone = normalize_phone_line(stripped)
         key = (company_name, company_link, phone)
-        if key not in seen:
+        if not deduplicate or key not in seen:
             rows.append(
                 {
                     "company_name": company_name,
