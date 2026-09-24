@@ -333,6 +333,27 @@ class QueueStore:
             self._event(connection, claim["job_id"], "RETRY_CONTACT", "Импорт отложен; будет прямая проверка.")
             connection.commit()
 
+    def retry_claim(self, claim: dict, error: Exception) -> None:
+        """Release an interrupted request without losing the item or account lease."""
+        timestamp = self.now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            attempts = connection.execute("SELECT attempts FROM job_items WHERE id = ?", (claim["id"],)).fetchone()[0]
+            status = "API_ERROR_FINAL" if attempts >= 3 else "RETRYABLE_ERROR"
+            delay = (30, 120, 600)[min(attempts - 1, 2)]
+            connection.execute(
+                """UPDATE job_items SET status = ?, detail = ?, next_attempt_at = ?, lease_owner = NULL,
+                   lease_expires_at = NULL, completed_at = ? WHERE id = ? AND lease_owner = ?""",
+                (status, str(error), timestamp + delay, None if status == "RETRYABLE_ERROR" else timestamp,
+                 claim["id"], claim["owner"]),
+            )
+            connection.execute(
+                "UPDATE worker_state SET lease_owner = NULL, lease_expires_at = NULL WHERE account_key = ? AND lease_owner = ?",
+                (claim["account_key"], claim["owner"]),
+            )
+            self._event(connection, claim["job_id"], "RETRYABLE_ERROR", "Временная ошибка Telegram; номер сохранён для повтора.")
+            connection.commit()
+
     def cancel(self, job_id: str) -> None:
         timestamp = self.now()
         with self._connect() as connection:

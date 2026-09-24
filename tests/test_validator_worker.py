@@ -30,3 +30,19 @@ def test_worker_moves_retry_contact_to_direct_lookup(tmp_path):
     assert gateway.imports == [["+79991234567"]]
     assert gateway.resolves == ["+79991234567"]
     assert store.rows(job_id)[0]["status"] == "FOUND"
+
+
+def test_worker_persists_temporary_gateway_failure_for_retry(tmp_path):
+    class FailingGateway:
+        def import_phones(self, phones):
+            raise RuntimeError("network unavailable")
+
+        def resolve_phone(self, phone):
+            raise AssertionError("not called")
+
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("+79991234567")
+    store.start(job_id)
+
+    assert ValidatorWorker(store, FailingGateway(), "test-worker").run_once() is True
+    assert store.rows(job_id)[0]["status"] == "RETRYABLE_ERROR"

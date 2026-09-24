@@ -22,13 +22,16 @@ class ValidatorWorker:
         claim = self.store.claim_next(self.owner)
         if not claim:
             return False
-        if claim["method"] == "DIRECT_LOOKUP":
-            self.store.finish_claim(claim, self.gateway.resolve_phone(claim["phone"]))
-            return True
-        results = self.gateway.import_phones([claim["phone"]])
-        result = results[claim["phone"]]
-        if result.get("retry"):
-            self.store.move_claim_to_direct_lookup(claim)
-        else:
-            self.store.finish_claim(claim, result)
+        try:
+            if claim["method"] == "DIRECT_LOOKUP":
+                self.store.finish_claim(claim, self.gateway.resolve_phone(claim["phone"]))
+                return True
+            results = self.gateway.import_phones([claim["phone"]])
+            result = results[claim["phone"]]
+            if result.get("retry"):
+                self.store.move_claim_to_direct_lookup(claim)
+            else:
+                self.store.finish_claim(claim, result)
+        except Exception as error:
+            self.store.retry_claim(claim, error)
         return True
