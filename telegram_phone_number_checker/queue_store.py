@@ -273,11 +273,20 @@ class QueueStore:
                 connection.execute("UPDATE worker_state SET lease_owner = NULL, lease_expires_at = NULL WHERE account_key = ?", (account_key,))
                 connection.commit()
                 return None
+            if item["method"] == "DIRECT_LOOKUP" and worker and worker["next_direct_lookup_at"] > timestamp:
+                connection.execute("UPDATE worker_state SET lease_owner = NULL, lease_expires_at = NULL WHERE account_key = ?", (account_key,))
+                connection.commit()
+                return None
             connection.execute(
                 """UPDATE job_items SET status = 'IN_PROGRESS', lease_owner = ?, lease_expires_at = ?,
                    attempts = attempts + 1, started_at = COALESCE(started_at, ?) WHERE id = ?""",
                 (owner, expires_at, timestamp, item["id"]),
             )
+            if item["method"] == "DIRECT_LOOKUP":
+                connection.execute(
+                    "UPDATE worker_state SET next_direct_lookup_at = ? WHERE account_key = ?",
+                    (timestamp + 3.1, account_key),
+                )
             connection.execute(
                 "UPDATE jobs SET state = 'RUNNING', run_lease_owner = ?, run_lease_expires_at = ?, updated_at = ? WHERE id = ?",
                 (owner, expires_at, timestamp, item["job_id"]),
@@ -305,6 +314,23 @@ class QueueStore:
                 (claim["account_key"], claim["owner"]),
             )
             self._event(connection, claim["job_id"], "RESULT", "Результат сохранён.")
+            connection.commit()
+
+    def move_claim_to_direct_lookup(self, claim: dict) -> None:
+        """Persist Telegram retry_contacts as direct lookup work, never re-import it."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE job_items SET status = 'PENDING', method = 'DIRECT_LOOKUP',
+                   detail = 'Telegram отложил импорт; запланирована прямая проверка.',
+                   lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND lease_owner = ?""",
+                (claim["id"], claim["owner"]),
+            )
+            connection.execute(
+                "UPDATE worker_state SET lease_owner = NULL, lease_expires_at = NULL WHERE account_key = ? AND lease_owner = ?",
+                (claim["account_key"], claim["owner"]),
+            )
+            self._event(connection, claim["job_id"], "RETRY_CONTACT", "Импорт отложен; будет прямая проверка.")
             connection.commit()
 
     def cancel(self, job_id: str) -> None:
