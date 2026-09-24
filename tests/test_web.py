@@ -74,6 +74,9 @@ def test_durable_job_page_shows_partial_rows_counts_and_controls_while_running(t
 
     assert "Обработано номеров: 1 из 2" in page
     assert "INVALID_PHONE" in page
+    assert "Этап:" in page
+    assert "обработано в этапе:" in page
+    assert "Статусы строк" in page
     assert f'action="/jobs/{job_id}/pause"' in page
     assert f'action="/jobs/{job_id}/cancel"' in page
     assert "stop-deferred" not in page

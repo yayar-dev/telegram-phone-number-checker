@@ -94,7 +94,6 @@ class DurableValidatorApplication:
             "error": job["last_error"],
             "rows": self.store.rows(job_id),
             "deferred_phones": [],
-            "eta_seconds": None,
         }
 
     def render_home_page(self) -> str:
@@ -222,10 +221,30 @@ def _render_page(job: dict | None = None, error: str = "", accept_jobs: bool = T
                 f"<p>Ожидание Telegram: следующая попытка через {remaining // 60} мин. "
                 f"{remaining % 60} сек.</p>"
             )
+        phase_labels = {
+            "IMPORT": "импорт контактов",
+            "DIRECT_LOOKUP": "прямая проверка",
+            "WAITING_RATE_LIMIT": "ожидание лимита Telegram",
+        }
+        status_lines = "".join(
+            f"<li>{html.escape(status)}: {count}</li>"
+            for status, count in sorted(job.get("counts", {}).items())
+        ) or "<li>Ожидает запуска</li>"
+        eta = ""
+        if job.get("eta_seconds") is not None and state not in {"COMPLETED", "CANCELLED"}:
+            remaining = job["eta_seconds"]
+            eta = f"<p>Оценка до завершения: примерно {remaining // 60} мин. {remaining % 60} сек.</p>"
+        speed = ""
+        if job.get("items_per_minute") is not None:
+            speed = f"<p>Скорость: {job['items_per_minute']} ном./мин.</p>"
         job_html = (
             f"<p>Обработано номеров: {processed} из {total}.</p>"
             f"<p>Найдено аккаунтов: {job.get('confirmed', 0)}.</p>"
-            f"{waiting}<p class=\"hint\">{message}</p>{controls}"
+            f"<p>Этап: {html.escape(phase_labels.get(job.get('phase', ''), job.get('phase', 'ожидание')))}; "
+            f"обработано в этапе: {job.get('phase_processed', 0)} из {job.get('phase_total', 0)}; "
+            f"осталось: {job.get('phase_remaining', 0)}.</p>"
+            f"{speed}{eta}{waiting}<details><summary>Статусы строк</summary><ul>{status_lines}</ul></details>"
+            f"<p class=\"hint\">{message}</p>{controls}"
         )
         results_html = _render_results(job["rows"], processed, total, job["id"])
 

@@ -61,6 +61,20 @@ def test_migration_preserves_found_deferred_and_unprocessed_ordinals(tmp_path):
     assert len(store.rows("legacy")) == 3
 
 
+def test_migration_keeps_the_legacy_deduplicated_row_count(tmp_path):
+    source = tmp_path / "jobs.json"
+    source.write_text(
+        json.dumps({"jobs": {"legacy": {"id": "legacy", "raw": "+79991234567\n+79991234567"}}}),
+        encoding="utf-8",
+    )
+
+    store = QueueStore(tmp_path / "validator.db")
+    store.migrate_json(source)
+
+    assert store.snapshot("legacy")["total"] == 1
+    assert [row["phone"] for row in store.rows("legacy")] == ["+79991234567"]
+
+
 def test_live_account_lease_excludes_second_process_and_cancel_preserves_found(tmp_path):
     store = QueueStore(tmp_path / "validator.db")
     job_id = store.create_job("+79991234567\n+79990000000")
@@ -73,6 +87,19 @@ def test_live_account_lease_excludes_second_process_and_cancel_preserves_found(t
     store.finish_claim(first, {"id": 1, "username": "known"})
     store.cancel(job_id)
     assert [row["status"] for row in store.rows(job_id)] == ["FOUND", "CANCELLED"]
+
+
+def test_cancel_keeps_an_already_sent_claim_and_saves_its_late_result(tmp_path):
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("+79991234567")
+    store.start(job_id)
+    claim = store.claim_next("worker-a")
+
+    store.cancel(job_id)
+    store.finish_claim(claim, {"id": 1, "username": "late"})
+
+    assert store.snapshot(job_id)["state"] == "CANCELLED"
+    assert store.rows(job_id)[0]["status"] == "FOUND"
 
 
 def test_claim_reclaims_an_expired_in_progress_item_lease(tmp_path):
@@ -127,6 +154,37 @@ def test_floodwait_blocks_every_job_and_automatically_resumes_after_deadline(tmp
 
     assert resumed_claim["phone"] == "+79991234567"
     assert reopened.snapshot(first_job)["state"] == "RUNNING"
+
+
+def test_cleanup_floodwait_returns_cleanup_to_the_durable_queue(tmp_path):
+    clock = Clock()
+    store = QueueStore(tmp_path / "validator.db", now=clock)
+    job_id = store.create_job("+79991234567")
+    store.start(job_id)
+    claim = store.claim_next("worker-a")
+    store.finish_claim(claim, {"id": 123, "username": "known"})
+    cleanup = store.claim_cleanup("worker-a")
+
+    store.defer_cleanup_floodwait(cleanup, seconds=90)
+
+    assert store.claim_cleanup("worker-b") is None
+    clock.value += 91
+    recovered = store.claim_cleanup("worker-b")
+    assert recovered["telegram_user_ids"] == [123]
+
+
+def test_renew_claims_keeps_a_slow_request_owned(tmp_path):
+    clock = Clock()
+    store = QueueStore(tmp_path / "validator.db", now=clock)
+    job_id = store.create_job("+79991234567")
+    store.start(job_id)
+    claim = store.claim_next("worker-a")
+
+    clock.value += 30
+    store.renew_claims([claim])
+    clock.value += 31
+
+    assert store.claim_next("worker-b") is None
 
 
 def test_malformed_json_keeps_source_and_enters_diagnostic_mode(tmp_path):

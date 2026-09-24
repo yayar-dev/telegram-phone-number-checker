@@ -6,6 +6,7 @@ work are persisted by the store before or after every network request.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Protocol
 
@@ -62,7 +63,7 @@ class ValidatorWorker:
 
         unique_phones = list(dict.fromkeys(claim["phone"] for claim in pending))
         try:
-            results = self.gateway.import_phones(unique_phones)
+            results = self._with_claim_lease(claims, lambda: self.gateway.import_phones(unique_phones))
         except FloodWaitError as error:
             self.store.defer_account_floodwait(claims, error.seconds)
             return True
@@ -97,7 +98,7 @@ class ValidatorWorker:
             self._finish(cached, self._results_for(cached))
             return True
         try:
-            result = self.gateway.resolve_phone(claim["phone"])
+            result = self._with_claim_lease([claim], lambda: self.gateway.resolve_phone(claim["phone"]))
         except FloodWaitError as error:
             self.store.defer_account_floodwait([claim], error.seconds)
             return True
@@ -164,11 +165,43 @@ class ValidatorWorker:
         if not claim:
             return False
         try:
-            self.gateway.cleanup_contacts(claim["telegram_user_ids"])
+            self._with_cleanup_lease(claim, lambda: self.gateway.cleanup_contacts(claim["telegram_user_ids"]))
         except FloodWaitError as error:
-            self.store.defer_account_floodwait([claim], error.seconds)
+            self.store.defer_cleanup_floodwait(claim, error.seconds)
         except Exception as error:
             self.store.retry_cleanup(claim, error)
         else:
             self.store.finish_cleanup(claim)
         return True
+
+    def _with_claim_lease(self, claims: list[dict], request):
+        renew = getattr(self.store, "renew_claims", None)
+        return self._with_lease(renew and (lambda: renew(claims)), request)
+
+    def _with_cleanup_lease(self, claim: dict, request):
+        renew = getattr(self.store, "renew_cleanup_claim", None)
+        return self._with_lease(renew and (lambda: renew(claim)), request)
+
+    @staticmethod
+    def _with_lease(renew, request):
+        """Renew the persisted lease while a blocking Telethon call is in flight."""
+        if not renew:
+            return request()
+        done = threading.Event()
+
+        def heartbeat():
+            while not done.wait(20):
+                try:
+                    renew()
+                except Exception:
+                    # Ownership remains valid until the original lease expires; the
+                    # request outcome is still persisted by the normal error path.
+                    pass
+
+        thread = threading.Thread(target=heartbeat, name="validator-lease", daemon=True)
+        thread.start()
+        try:
+            return request()
+        finally:
+            done.set()
+            thread.join(timeout=0.1)

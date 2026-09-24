@@ -157,7 +157,10 @@ class QueueStore:
                 if connection.execute("SELECT 1 FROM jobs WHERE id = ?", (legacy_id,)).fetchone():
                     continue
                 raw = str(legacy.get("raw", ""))
-                entries = parse_company_phone_batch(raw, deduplicate=False)
+                # The legacy UI used its default de-duplicating parser. Keep its
+                # persisted row count exactly during migration; new jobs retain
+                # every ordinal through create_job(..., deduplicate=False).
+                entries = parse_company_phone_batch(raw)
                 resume_after = legacy.get("waiting_until")
                 state_name = "WAITING_RATE_LIMIT" if resume_after and resume_after > timestamp else "QUEUED"
                 connection.execute(
@@ -243,7 +246,33 @@ class QueueStore:
         by_status = {row["status"]: row["count"] for row in counts}
         processed = sum(by_status.get(status, 0) for status in TERMINAL_STATUSES)
         confirmed = by_status.get("FOUND", 0) + by_status.get("FOUND_NO_USERNAME", 0)
-        return {**dict(job), "total": job["total_rows"], "processed": processed, "confirmed": confirmed, "counts": by_status}
+        timestamp = self.now()
+        started_at = job["started_at"]
+        eta_seconds = None
+        if started_at and processed:
+            rate = processed / max(timestamp - started_at, 0.001)
+            eta_seconds = max(0, round((job["total_rows"] - processed) / rate))
+        phase = job["phase"]
+        phase_total = phase_remaining = 0
+        if phase in {"IMPORT", "DIRECT_LOOKUP"}:
+            method_clause = "method = 'DIRECT_LOOKUP'" if phase == "DIRECT_LOOKUP" else "method != 'DIRECT_LOOKUP'"
+            with self._connect() as connection:
+                phase_total = connection.execute(
+                    "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND " + method_clause,
+                    (job_id,),
+                ).fetchone()[0]
+                phase_remaining = connection.execute(
+                    "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND " + method_clause +
+                    " AND status NOT IN (%s)" % ",".join("?" for _ in TERMINAL_STATUSES),
+                    (job_id, *TERMINAL_STATUSES),
+                ).fetchone()[0]
+        return {
+            **dict(job), "total": job["total_rows"], "processed": processed,
+            "confirmed": confirmed, "counts": by_status, "phase_remaining": phase_remaining,
+            "phase_total": phase_total, "phase_processed": phase_total - phase_remaining,
+            "items_per_minute": round(processed / max(timestamp - started_at, 0.001) * 60, 1) if started_at and processed else None,
+            "eta_seconds": eta_seconds,
+        }
 
     def rows(self, job_id: str) -> list[dict[str, str]]:
         with self._connect() as connection:
@@ -289,6 +318,19 @@ class QueueStore:
                    SELECT 1 FROM jobs j WHERE j.id = job_items.job_id
                    AND j.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED')
                )""",
+            (timestamp,),
+        )
+        connection.execute(
+            """UPDATE job_items SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL,
+               completed_at = ?, detail = 'Проверка отменена пользователем.'
+               WHERE status = 'IN_PROGRESS' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+               AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = job_items.job_id AND j.state = 'CANCELLED')""",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            """UPDATE contact_cleanup SET state = 'PENDING', lease_owner = NULL, lease_expires_at = NULL,
+               next_attempt_at = NULL, last_error = 'Очистка восстановлена после перезапуска.'
+               WHERE state = 'IN_PROGRESS' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
             (timestamp,),
         )
         waiting = connection.execute(
@@ -412,8 +454,9 @@ class QueueStore:
                     (timestamp, account_key),
                 )
             connection.execute(
-                "UPDATE jobs SET state = 'RUNNING', run_lease_owner = ?, run_lease_expires_at = ?, updated_at = ? WHERE id = ?",
-                (owner, expires_at, timestamp, item["job_id"]),
+                """UPDATE jobs SET state = 'RUNNING', phase = ?, run_lease_owner = ?,
+                   run_lease_expires_at = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?""",
+                (item["method"], owner, expires_at, timestamp, timestamp, item["job_id"]),
             )
             connection.commit()
             return [
@@ -552,6 +595,81 @@ class QueueStore:
                    next_available_at = CASE WHEN next_available_at > ? THEN next_available_at ELSE ? END,
                    updated_at = ? WHERE account_key = ? AND lease_owner = ?""",
                 (resume_after, resume_after, timestamp, account_key, owner),
+            )
+            connection.commit()
+
+    def defer_cleanup_floodwait(self, claim: dict, seconds: int) -> None:
+        """Return cleanup work to the same account-wide FloodWait schedule."""
+        if seconds <= 0:
+            raise ValueError("FloodWait must be positive.")
+        timestamp = self.now()
+        resume_after = timestamp + seconds
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.executemany(
+                """UPDATE contact_cleanup SET state = 'PENDING', next_attempt_at = ?, lease_owner = NULL,
+                   lease_expires_at = NULL, last_error = 'Telegram ограничил очистку контактов.'
+                   WHERE id = ? AND state = 'IN_PROGRESS' AND lease_owner = ?""",
+                [(resume_after, cleanup_id, claim["owner"]) for cleanup_id in claim["cleanup_ids"]],
+            )
+            connection.execute(
+                """UPDATE jobs SET state = 'WAITING_RATE_LIMIT', phase = 'WAITING_RATE_LIMIT',
+                   resume_after = ?, message = 'Telegram ограничил очистку контактов; ожидание сохранено.',
+                   updated_at = ? WHERE id = ? AND state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED')""",
+                (resume_after, timestamp, claim["job_id"]),
+            )
+            connection.execute(
+                """UPDATE worker_state SET lease_owner = NULL, lease_expires_at = NULL,
+                   next_available_at = CASE WHEN next_available_at > ? THEN next_available_at ELSE ? END,
+                   updated_at = ? WHERE account_key = ? AND lease_owner = ?""",
+                (resume_after, resume_after, timestamp, claim["account_key"], claim["owner"]),
+            )
+            self._event(connection, claim["job_id"], "CLEANUP_FLOOD_WAIT", "Очистка контактов отложена Telegram.")
+            connection.commit()
+
+    def renew_claims(self, claims: list[dict], lease_seconds: int = 60) -> None:
+        """Extend ownership while a synchronous Telegram request is still running."""
+        if not claims:
+            return
+        timestamp = self.now()
+        expires_at = timestamp + lease_seconds
+        owner = claims[0]["owner"]
+        account_key = claims[0]["account_key"]
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE worker_state SET lease_expires_at = ?, updated_at = ?
+                   WHERE account_key = ? AND lease_owner = ?""",
+                (expires_at, timestamp, account_key, owner),
+            )
+            connection.executemany(
+                """UPDATE job_items SET lease_expires_at = ? WHERE id = ?
+                   AND status = 'IN_PROGRESS' AND lease_owner = ?""",
+                [(expires_at, claim["id"], owner) for claim in claims],
+            )
+            for job_id in {claim["job_id"] for claim in claims}:
+                connection.execute(
+                    """UPDATE jobs SET run_lease_expires_at = ?, updated_at = ? WHERE id = ?
+                       AND state = 'RUNNING' AND run_lease_owner = ?""",
+                    (expires_at, timestamp, job_id, owner),
+                )
+            connection.commit()
+
+    def renew_cleanup_claim(self, claim: dict, lease_seconds: int = 60) -> None:
+        """Extend cleanup ownership while Telegram is deleting imported contacts."""
+        timestamp = self.now()
+        expires_at = timestamp + lease_seconds
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE worker_state SET lease_expires_at = ?, updated_at = ?
+                   WHERE account_key = ? AND lease_owner = ?""",
+                (expires_at, timestamp, claim["account_key"], claim["owner"]),
+            )
+            connection.executemany(
+                """UPDATE contact_cleanup SET lease_expires_at = ? WHERE id = ?
+                   AND state = 'IN_PROGRESS' AND lease_owner = ?""",
+                [(expires_at, cleanup_id, claim["owner"]) for cleanup_id in claim["cleanup_ids"]],
             )
             connection.commit()
 
@@ -717,8 +835,10 @@ class QueueStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             changed = connection.execute(
-                "UPDATE jobs SET state = 'QUEUED', message = 'Задача ожидает worker.', updated_at = ? WHERE id = ? AND state IN ('STAGED', 'PAUSED', 'WAITING_RATE_LIMIT')",
-                (self.now(), job_id),
+                """UPDATE jobs SET state = 'QUEUED', phase = 'IMPORT', message = 'Задача ожидает worker.',
+                   started_at = COALESCE(started_at, ?), updated_at = ?
+                   WHERE id = ? AND state IN ('STAGED', 'PAUSED', 'WAITING_RATE_LIMIT')""",
+                (self.now(), self.now(), job_id),
             ).rowcount
             if changed:
                 self._event(connection, job_id, "STARTED", "Запущена обработка задачи.")

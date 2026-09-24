@@ -2,6 +2,9 @@
 *.session
 *.session-journal
 *.json
+.validator.db
+.validator.db-shm
+.validator.db-wal
 .venv/
 dist/
 
