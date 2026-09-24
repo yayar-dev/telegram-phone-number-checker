@@ -277,6 +277,17 @@ class QueueStore:
             "eta_seconds": eta_seconds,
         }
 
+    def list_jobs(self) -> list[dict]:
+        """Return durable jobs for the local operator's queue overview."""
+        with self._connect() as connection:
+            job_ids = [
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM jobs ORDER BY updated_at DESC, created_at DESC"
+                ).fetchall()
+            ]
+        return [snapshot for job_id in job_ids if (snapshot := self.snapshot(job_id))]
+
     def rows(self, job_id: str) -> list[dict[str, str]]:
         with self._connect() as connection:
             items = connection.execute(

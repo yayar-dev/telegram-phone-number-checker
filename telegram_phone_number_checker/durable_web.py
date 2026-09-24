@@ -97,7 +97,11 @@ class DurableValidatorApplication:
         }
 
     def render_home_page(self) -> str:
-        return _render_page(error=self.startup_error, accept_jobs=not self.startup_error)
+        return _render_page(
+            error=self.startup_error,
+            accept_jobs=not self.startup_error,
+            jobs=self.store.list_jobs(),
+        )
 
     def render_job_page(self, job_id: str) -> str:
         job = self.snapshot(job_id)
@@ -188,12 +192,15 @@ def create_server(application: DurableValidatorApplication, port: int) -> Thread
     return ThreadingHTTPServer(("127.0.0.1", port), application.handler())
 
 
-def _render_page(job: dict | None = None, error: str = "", accept_jobs: bool = True) -> str:
+def _render_page(
+    job: dict | None = None, error: str = "", accept_jobs: bool = True, jobs: list[dict] | None = None,
+) -> str:
     """Render the durable-queue UI without inheriting the legacy job controls."""
     raw = job.get("raw", "") if job else ""
     job_html = ""
     results_html = ""
     refresh_html = ""
+    queues_html = ""
 
     if job:
         state = job["state"]
@@ -248,6 +255,15 @@ def _render_page(job: dict | None = None, error: str = "", accept_jobs: bool = T
         )
         results_html = _render_results(job["rows"], processed, total, job["id"])
 
+    if jobs:
+        rows = "".join(
+            f'<li><a href="/jobs/{html.escape(item["id"], quote=True)}">'
+            f'Задача {html.escape(item["id"][:8])}</a>: {html.escape(item["state"])} — '
+            f'{item["processed"]} из {item["total"]}.</li>'
+            for item in jobs
+        )
+        queues_html = f"<h2>Сохранённые очереди</h2><ul>{rows}</ul>"
+
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
     disabled = " disabled" if not accept_jobs else ""
     return f"""<!doctype html>
@@ -256,7 +272,7 @@ def _render_page(job: dict | None = None, error: str = "", accept_jobs: bool = T
 <style>body{{font:16px system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 20px;color:#18212b}}textarea{{width:100%;min-height:220px;box-sizing:border-box;font:inherit}}button,.button{{display:inline-block;background:#276ef1;color:white;padding:10px 14px;border:0;border-radius:6px;text-decoration:none;font:inherit;cursor:pointer;margin-right:8px}}.secondary{{background:#667085}}label{{display:block;margin:16px 0 8px}}.hint{{color:#586574}}.error{{color:#b42318}}table{{border-collapse:collapse;width:100%;font-size:14px;margin-top:16px}}th,td{{border:1px solid #d0d5dd;padding:8px;text-align:left;vertical-align:top;word-break:break-word}}th{{background:#f2f4f7}}.action{{display:inline}}</style>
 </head><body><h1>Проверка номеров Telegram</h1>
 <p class="hint">Вставьте номера по одному в строке. Перед группой укажите компанию обычной строкой или как <code>[Название](https://example.com)</code>.</p>
-{error_html}<form id="queue-form" method="post" action="/check"><label for="phone_numbers">Компании и номера</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="ООО Пример&#10;+79991234567&#10;+447911123456"{disabled}>{html.escape(raw)}</textarea><input id="queue-confirmation" type="hidden" name="queue_confirmation" value=""><p><button id="queue-button" type="button"{disabled}>Поставить в очередь</button></p></form>{job_html}{results_html}
+   {error_html}<form id="queue-form" method="post" action="/check"><label for="phone_numbers">Компании и номера</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="ООО Пример&#10;+79991234567&#10;+447911123456"{disabled}>{html.escape(raw)}</textarea><input id="queue-confirmation" type="hidden" name="queue_confirmation" value=""><p><button id="queue-button" type="button"{disabled}>Поставить в очередь</button></p></form>{queues_html}{job_html}{results_html}
 <script>const form=document.getElementById('queue-form');const confirmation=document.getElementById('queue-confirmation');document.getElementById('queue-button').addEventListener('click',()=>{{confirmation.value='yes';form.requestSubmit();}});form.addEventListener('submit',(event)=>{{if(confirmation.value!=='yes')event.preventDefault();}});</script>
 </body></html>"""
 

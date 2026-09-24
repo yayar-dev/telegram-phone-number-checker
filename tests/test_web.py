@@ -124,6 +124,17 @@ def test_durable_web_stages_job_until_explicit_start(tmp_path):
     assert app.start(job_id) is True
 
 
+def test_durable_home_page_lists_a_staged_queue(tmp_path):
+    app = DurableValidatorApplication(tmp_path / "validator.db")
+    job_id = app.enqueue("+79991234567")
+
+    page = app.render_home_page()
+
+    assert f'href="/jobs/{job_id}"' in page
+    assert "Сохранённые очереди" in page
+    assert "STAGED" in page
+
+
 def test_web_uses_one_batch_lookup_for_valid_phone_numbers(monkeypatch):
     batch_calls = []
 
