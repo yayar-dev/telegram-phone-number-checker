@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import time
 from pathlib import Path
@@ -123,6 +124,74 @@ class QueueStore:
             connection.commit()
         return job_id
 
+    def migrate_json(self, source: Path) -> None:
+        """Import the former JSON snapshots once, without modifying their source."""
+        contents = source.read_bytes()
+        checksum = hashlib.sha256(contents).hexdigest()
+        state = json.loads(contents.decode("utf-8"))
+        legacy_jobs = state.get("jobs")
+        if not isinstance(legacy_jobs, dict):
+            raise ValueError("Файл очереди не содержит jobs.")
+        timestamp = self.now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            marker = f"json_migrated:{checksum}"
+            if connection.execute("SELECT 1 FROM schema_meta WHERE key = ?", (marker,)).fetchone():
+                connection.commit()
+                return
+            for legacy_id, legacy in legacy_jobs.items():
+                if connection.execute("SELECT 1 FROM jobs WHERE id = ?", (legacy_id,)).fetchone():
+                    continue
+                raw = str(legacy.get("raw", ""))
+                entries = parse_company_phone_batch(raw, deduplicate=False)
+                resume_after = legacy.get("waiting_until")
+                state_name = "WAITING_RATE_LIMIT" if resume_after and resume_after > timestamp else "QUEUED"
+                connection.execute(
+                    """INSERT INTO jobs(id, raw_input, state, phase, message, created_at, updated_at,
+                       total_rows, resume_after)
+                       VALUES (?, ?, ?, 'IMPORT', 'Задача перенесена из JSON.', ?, ?, ?, ?)""",
+                    (legacy_id, raw, state_name, timestamp, timestamp, len(entries), resume_after),
+                )
+                results = legacy.get("results_by_phone", {})
+                deferred = set(legacy.get("deferred_phones", []))
+                skip_deferred = bool(legacy.get("skip_deferred"))
+                for ordinal, entry in enumerate(entries):
+                    phone = entry["phone"]
+                    result = results.get(phone, {})
+                    status, method, detail = "PENDING", "IMPORT", ""
+                    fields: dict[str, str] = {}
+                    if not is_valid_phone(phone):
+                        status, method, detail = "INVALID_PHONE", "NONE", "Введите номер в международном формате, например +79991234567."
+                    elif result.get("skipped") or (skip_deferred and phone in deferred):
+                        status, method, detail = "DEFERRED_NOT_CHECKED", "NONE", result.get("error", "Проверка отложена пользователем.")
+                    elif result.get("id"):
+                        username = result.get("username") or ""
+                        status, method = ("FOUND" if username else "FOUND_NO_USERNAME"), "MIGRATED"
+                        name = " ".join(filter(None, [result.get("first_name"), result.get("last_name")]))
+                        fields = {
+                            "telegram_id": str(result["id"]), "username": username, "name": name,
+                            "telegram_link": f"https://t.me/{username}" if username else f"https://t.me/{phone}?profile",
+                        }
+                    elif result.get("retry") or phone in deferred:
+                        method = "DIRECT_LOOKUP"
+                    elif str(result.get("error", "")).startswith("No response"):
+                        status, method, detail = "UNRESOLVABLE_OR_PRIVACY", "MIGRATED", result["error"]
+                    elif result.get("error"):
+                        status, method, detail = "RETRYABLE_ERROR", "IMPORT", result["error"]
+                    completed_at = timestamp if status in TERMINAL_STATUSES else None
+                    connection.execute(
+                        """INSERT INTO job_items(job_id, ordinal, company_name, company_link, raw_phone,
+                           normalized_phone, status, method, detail, telegram_id, username, name,
+                           telegram_link, completed_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (legacy_id, ordinal, entry["company_name"], entry["company_link"], phone, phone,
+                         status, method, detail, fields.get("telegram_id", ""), fields.get("username", ""),
+                         fields.get("name", ""), fields.get("telegram_link", ""), completed_at),
+                    )
+                self._event(connection, legacy_id, "JSON_MIGRATED", "Очередь перенесена из JSON.")
+            connection.execute("INSERT INTO schema_meta(key, value) VALUES (?, ?)", (marker, str(timestamp)))
+            connection.commit()
+
     def _event(self, connection: sqlite3.Connection, job_id: str, kind: str, message: str) -> None:
         counts = connection.execute(
             "SELECT COUNT(*) AS total, SUM(status IN (%s)) AS completed FROM job_items WHERE job_id = ?"
@@ -169,3 +238,86 @@ class QueueStore:
                 }
             rows.append({"company_name": item["company_name"], "company_link": item["company_link"], **rendered})
         return rows
+
+    def claim_next(self, owner: str, account_key: str = "default") -> dict | None:
+        """Claim one ready item and the account lease before a Telegram request."""
+        timestamp = self.now()
+        expires_at = timestamp + 60
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            worker = connection.execute(
+                "SELECT * FROM worker_state WHERE account_key = ?", (account_key,)
+            ).fetchone()
+            if worker and (
+                worker["next_available_at"] > timestamp
+                or (worker["lease_owner"] and worker["lease_owner"] != owner and worker["lease_expires_at"] > timestamp)
+            ):
+                connection.commit()
+                return None
+            connection.execute(
+                """INSERT INTO worker_state(account_key, lease_owner, lease_expires_at, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(account_key) DO UPDATE SET lease_owner = excluded.lease_owner,
+                   lease_expires_at = excluded.lease_expires_at, updated_at = excluded.updated_at""",
+                (account_key, owner, expires_at, timestamp),
+            )
+            item = connection.execute(
+                """SELECT i.* FROM job_items i JOIN jobs j ON j.id = i.job_id
+                   WHERE i.status IN ('PENDING', 'RETRYABLE_ERROR')
+                   AND (i.next_attempt_at IS NULL OR i.next_attempt_at <= ?)
+                   AND j.state IN ('QUEUED', 'RUNNING')
+                   ORDER BY CASE i.method WHEN 'DIRECT_LOOKUP' THEN 0 ELSE 1 END, i.id LIMIT 1""",
+                (timestamp,),
+            ).fetchone()
+            if not item:
+                connection.execute("UPDATE worker_state SET lease_owner = NULL, lease_expires_at = NULL WHERE account_key = ?", (account_key,))
+                connection.commit()
+                return None
+            connection.execute(
+                """UPDATE job_items SET status = 'IN_PROGRESS', lease_owner = ?, lease_expires_at = ?,
+                   attempts = attempts + 1, started_at = COALESCE(started_at, ?) WHERE id = ?""",
+                (owner, expires_at, timestamp, item["id"]),
+            )
+            connection.execute(
+                "UPDATE jobs SET state = 'RUNNING', run_lease_owner = ?, run_lease_expires_at = ?, updated_at = ? WHERE id = ?",
+                (owner, expires_at, timestamp, item["job_id"]),
+            )
+            connection.commit()
+            return {**dict(item), "phone": item["normalized_phone"], "owner": owner, "account_key": account_key}
+
+    def finish_claim(self, claim: dict, result: dict) -> None:
+        timestamp = self.now()
+        mapped = map_lookup_result(claim["phone"], result)
+        status = mapped["status"]
+        if status == "NOT_FOUND_OR_PRIVACY_RESTRICTED":
+            status = "UNRESOLVABLE_OR_PRIVACY"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE job_items SET status = ?, method = ?, detail = ?, telegram_id = ?, username = ?,
+                   name = ?, telegram_link = ?, lease_owner = NULL, lease_expires_at = NULL, completed_at = ?
+                   WHERE id = ? AND lease_owner = ?""",
+                (status, claim["method"], mapped["detail"], mapped["telegram_id"], mapped["username"],
+                 mapped["name"], mapped["telegram_link"], timestamp, claim["id"], claim["owner"]),
+            )
+            connection.execute(
+                "UPDATE worker_state SET lease_owner = NULL, lease_expires_at = NULL WHERE account_key = ? AND lease_owner = ?",
+                (claim["account_key"], claim["owner"]),
+            )
+            self._event(connection, claim["job_id"], "RESULT", "Результат сохранён.")
+            connection.commit()
+
+    def cancel(self, job_id: str) -> None:
+        timestamp = self.now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE job_items SET status = 'CANCELLED', detail = 'Проверка отменена пользователем.',
+                   completed_at = ? WHERE job_id = ? AND status IN ('PENDING', 'RETRYABLE_ERROR')""",
+                (timestamp, job_id),
+            )
+            connection.execute(
+                "UPDATE jobs SET state = 'CANCELLED', updated_at = ? WHERE id = ?", (timestamp, job_id)
+            )
+            self._event(connection, job_id, "CANCELLED", "Проверка отменена пользователем.")
+            connection.commit()
