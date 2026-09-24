@@ -19,6 +19,7 @@ class Gateway:
 def test_worker_moves_retry_contact_to_direct_lookup(tmp_path):
     store = QueueStore(tmp_path / "validator.db")
     job_id = store.create_job("+79991234567")
+    assert store.start(job_id) is True
     gateway = Gateway()
     worker = ValidatorWorker(store, gateway, "test-worker")
 

@@ -744,9 +744,17 @@ def get_port() -> int:
 
 
 def main() -> None:
+    from telegram_phone_number_checker.durable_web import (
+        DurableValidatorApplication,
+        create_server as create_durable_server,
+    )
+
     port = get_port()
-    server = create_server(
-        ValidatorApplication(state_path=Path(".validator-jobs.json")), port=port
+    server = create_durable_server(
+        DurableValidatorApplication(
+            Path(".validator.db"), legacy_json_path=Path(".validator-jobs.json")
+        ),
+        port=port,
     )
     print(f"Откройте http://127.0.0.1:{port}")
     try:

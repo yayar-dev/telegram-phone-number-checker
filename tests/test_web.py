@@ -7,11 +7,21 @@ import asyncio
 import pytest
 
 from telegram_phone_number_checker import web
+from telegram_phone_number_checker.durable_web import DurableValidatorApplication
 
 
 def test_reads_custom_port_from_environment(monkeypatch):
     monkeypatch.setenv("TELEGRAM_VALIDATOR_PORT", "8010")
     assert web.get_port() == 8010
+
+
+def test_durable_web_stages_job_until_explicit_start(tmp_path):
+    app = DurableValidatorApplication(tmp_path / "validator.db")
+
+    job_id = app.enqueue("+79991234567")
+
+    assert app.snapshot(job_id)["started"] is False
+    assert app.start(job_id) is True
 
 
 def test_web_uses_one_batch_lookup_for_valid_phone_numbers(monkeypatch):

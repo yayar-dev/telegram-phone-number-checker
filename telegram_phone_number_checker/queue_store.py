@@ -106,7 +106,7 @@ class QueueStore:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """INSERT INTO jobs(id, raw_input, state, phase, message, created_at, updated_at, total_rows)
-                   VALUES (?, ?, 'QUEUED', 'IMPORT', 'Задача поставлена в очередь.', ?, ?, ?)""",
+                   VALUES (?, ?, 'STAGED', 'IMPORT', 'Задача поставлена в очередь.', ?, ?, ?)""",
                 (job_id, raw, timestamp, timestamp, len(entries)),
             )
             for ordinal, entry in enumerate(entries):
@@ -346,4 +346,46 @@ class QueueStore:
                 "UPDATE jobs SET state = 'CANCELLED', updated_at = ? WHERE id = ?", (timestamp, job_id)
             )
             self._event(connection, job_id, "CANCELLED", "Проверка отменена пользователем.")
+            connection.commit()
+
+    def start(self, job_id: str) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                "UPDATE jobs SET state = 'QUEUED', message = 'Задача ожидает worker.', updated_at = ? WHERE id = ? AND state IN ('STAGED', 'PAUSED', 'WAITING_RATE_LIMIT')",
+                (self.now(), job_id),
+            ).rowcount
+            if changed:
+                self._event(connection, job_id, "STARTED", "Запущена обработка задачи.")
+            connection.commit()
+            return bool(changed)
+
+    def pause(self, job_id: str) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                "UPDATE jobs SET state = 'PAUSED', paused_at = ?, message = 'Обработка приостановлена.', updated_at = ? WHERE id = ? AND state IN ('QUEUED', 'RUNNING', 'WAITING_RATE_LIMIT')",
+                (self.now(), self.now(), job_id),
+            ).rowcount
+            if changed:
+                self._event(connection, job_id, "PAUSED", "Обработка приостановлена.")
+            connection.commit()
+            return bool(changed)
+
+    def finalize_ready_jobs(self) -> None:
+        timestamp = self.now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for job in connection.execute("SELECT id FROM jobs WHERE state IN ('QUEUED', 'RUNNING')").fetchall():
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND status NOT IN (%s)"
+                    % ",".join("?" for _ in TERMINAL_STATUSES),
+                    (job["id"], *TERMINAL_STATUSES),
+                ).fetchone()[0]
+                if not remaining:
+                    connection.execute(
+                        "UPDATE jobs SET state = 'COMPLETED', message = 'Готово.', completed_at = ?, updated_at = ? WHERE id = ?",
+                        (timestamp, timestamp, job["id"]),
+                    )
+                    self._event(connection, job["id"], "COMPLETED", "Задача завершена.")
             connection.commit()

@@ -56,6 +56,7 @@ def test_migration_preserves_found_deferred_and_unprocessed_ordinals(tmp_path):
 def test_live_account_lease_excludes_second_process_and_cancel_preserves_found(tmp_path):
     store = QueueStore(tmp_path / "validator.db")
     job_id = store.create_job("+79991234567\n+79990000000")
+    assert store.start(job_id) is True
 
     first = store.claim_next("worker-a")
 
