@@ -52,6 +52,7 @@ def test_migration_preserves_found_deferred_and_unprocessed_ordinals(tmp_path):
 
     store.migrate_json(source)
 
+    assert store.snapshot("legacy")["state"] == "STAGED"
     assert [row["status"] for row in store.rows("legacy")] == [
         "FOUND",
         "DEFERRED_NOT_CHECKED",

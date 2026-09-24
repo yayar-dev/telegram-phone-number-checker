@@ -161,12 +161,15 @@ class QueueStore:
                 # persisted row count exactly during migration; new jobs retain
                 # every ordinal through create_job(..., deduplicate=False).
                 entries = parse_company_phone_batch(raw)
+                # A legacy queue had no durable explicit-start state.  Do not make
+                # network requests merely because the service is upgraded: retain
+                # every row and let the operator start the migrated job explicitly.
                 resume_after = legacy.get("waiting_until")
-                state_name = "WAITING_RATE_LIMIT" if resume_after and resume_after > timestamp else "QUEUED"
+                state_name = "STAGED"
                 connection.execute(
                     """INSERT INTO jobs(id, raw_input, state, phase, message, created_at, updated_at,
                        total_rows, resume_after)
-                       VALUES (?, ?, ?, 'IMPORT', 'Задача перенесена из JSON.', ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, 'IMPORT', 'Задача перенесена из JSON; ожидает явного запуска.', ?, ?, ?, ?)""",
                     (legacy_id, raw, state_name, timestamp, timestamp, len(entries), resume_after),
                 )
                 results = legacy.get("results_by_phone", {})
