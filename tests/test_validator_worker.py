@@ -63,7 +63,12 @@ class BatchStore:
         self.cleanup_retries = []
 
     def claim_batch(self, owner, limit):
-        selected, self.claims = self.claims[:limit], self.claims[limit:]
+        if not self.claims:
+            return []
+        job_id = self.claims[0]["job_id"]
+        selected = [claim for claim in self.claims if claim["job_id"] == job_id][:limit]
+        selected_ids = {claim["id"] for claim in selected}
+        self.claims = [claim for claim in self.claims if claim["id"] not in selected_ids]
         return selected
 
     def finish_batch(self, claims, results):
@@ -125,6 +130,31 @@ def test_worker_imports_at_most_ten_unique_phones_and_reuses_duplicate_result():
 
     assert gateway.imports == [["+79990000001"]]
     assert [item_id for item_id, _ in store.finished] == list(range(1, 12))
+
+
+def test_worker_does_not_reuse_a_cached_phone_result_for_another_job():
+    store = BatchStore([
+        _claim(1, "+79990000001", job_id="job-1"),
+        _claim(2, "+79990000001", job_id="job-2"),
+    ])
+
+    class Gateway:
+        def __init__(self):
+            self.imports = []
+
+        def import_phones(self, phones):
+            self.imports.append(phones)
+            return {phones[0]: {"id": len(self.imports)}}
+
+        def resolve_phone(self, phone):
+            raise AssertionError("not called")
+
+    gateway = Gateway()
+    worker = ValidatorWorker(store, gateway, "test-worker")
+    assert worker.run_once() is True
+    assert worker.run_once() is True
+
+    assert gateway.imports == [["+79990000001"], ["+79990000001"]]
 
 
 def test_worker_reduces_later_import_batches_after_retry_contacts():

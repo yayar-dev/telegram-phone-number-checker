@@ -30,7 +30,7 @@ class ValidatorWorker:
         self.sleep = sleep
         # Avoid a second request for a duplicate that appears in a later claimed
         # batch. The store also deduplicates durable work across restarts.
-        self._results_by_phone: dict[str, dict] = {}
+        self._results_by_phone: dict[tuple[str, str], dict] = {}
 
     def run_once(self) -> bool:
         if self._run_cleanup_once():
@@ -82,7 +82,7 @@ class ValidatorWorker:
         if completed_claims:
             completed_results = self._results_for(completed_claims, normalized_results)
             self._finish(completed_claims, completed_results)
-            self._remember(completed_results)
+            self._remember(completed_claims, completed_results)
         if retry_claims:
             self._move_to_direct_lookup(retry_claims)
             self._reduce_import_batch_size(retry_claims[0])
@@ -105,21 +105,33 @@ class ValidatorWorker:
             self.store.retry_claim(claim, error)
             return True
         self._finish([claim], {claim["phone"]: result})
-        self._remember({claim["phone"]: result})
+        self._remember([claim], {claim["phone"]: result})
         return True
 
     def _split_cached_claims(self, claims: list[dict]) -> tuple[list[dict], list[dict]]:
-        cached = [claim for claim in claims if claim["phone"] in self._results_by_phone]
+        cached = [
+            claim
+            for claim in claims
+            if (claim["job_id"], claim["phone"]) in self._results_by_phone
+        ]
         return cached, [claim for claim in claims if claim not in cached]
 
     def _results_for(self, claims: list[dict], source: dict[str, dict] | None = None) -> dict[str, dict]:
-        source = source or self._results_by_phone
-        return {claim["phone"]: source[claim["phone"]] for claim in claims}
+        if source is not None:
+            return {claim["phone"]: source[claim["phone"]] for claim in claims}
+        return {
+            claim["phone"]: self._results_by_phone[(claim["job_id"], claim["phone"])]
+            for claim in claims
+        }
 
-    def _remember(self, results: dict[str, dict]) -> None:
-        self._results_by_phone.update(
-            {phone: result for phone, result in results.items() if not result.get("retry")}
-        )
+    def _remember(self, claims: list[dict], results: dict[str, dict]) -> None:
+        # Cache is filled by the claims that received a result, preserving job
+        # isolation while coalescing duplicate phones within one import batch.
+        for phone, result in results.items():
+            if not result.get("retry"):
+                for claim in claims:
+                    if claim["phone"] == phone:
+                        self._results_by_phone[(claim["job_id"], phone)] = result
 
     def _finish(self, claims: list[dict], results: dict[str, dict]) -> None:
         finish_batch = getattr(self.store, "finish_batch", None)

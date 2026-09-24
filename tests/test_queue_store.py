@@ -3,6 +3,14 @@ import json
 from telegram_phone_number_checker.queue_store import QueueStore
 
 
+class Clock:
+    def __init__(self, value=1_000.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
 def test_store_creates_every_input_ordinal_and_restores_it(tmp_path):
     database = tmp_path / "validator.db"
     store = QueueStore(database)
@@ -65,3 +73,70 @@ def test_live_account_lease_excludes_second_process_and_cancel_preserves_found(t
     store.finish_claim(first, {"id": 1, "username": "known"})
     store.cancel(job_id)
     assert [row["status"] for row in store.rows(job_id)] == ["FOUND", "CANCELLED"]
+
+
+def test_claim_reclaims_an_expired_in_progress_item_lease(tmp_path):
+    clock = Clock()
+    store = QueueStore(tmp_path / "validator.db", now=clock)
+    job_id = store.create_job("+79991234567")
+    assert store.start(job_id) is True
+    first_claim = store.claim_next("worker-a")
+
+    clock.value += 61
+    recovered_claim = QueueStore(tmp_path / "validator.db", now=clock).claim_next("worker-b")
+
+    assert recovered_claim["id"] == first_claim["id"]
+    assert recovered_claim["owner"] == "worker-b"
+    assert QueueStore(tmp_path / "validator.db", now=clock).snapshot(job_id)["state"] == "RUNNING"
+
+
+def test_reconcile_requeues_an_expired_running_job_lease_without_item_loss(tmp_path):
+    clock = Clock()
+    store = QueueStore(tmp_path / "validator.db", now=clock)
+    job_id = store.create_job("+79991234567\n+79990000000")
+    assert store.start(job_id) is True
+    store.claim_next("worker-a")
+
+    clock.value += 61
+    store.reconcile()
+
+    snapshot = store.snapshot(job_id)
+    assert snapshot["state"] == "QUEUED"
+    assert snapshot["counts"]["PENDING"] == 2
+
+
+def test_floodwait_blocks_every_job_and_automatically_resumes_after_deadline(tmp_path):
+    clock = Clock()
+    database = tmp_path / "validator.db"
+    store = QueueStore(database, now=clock)
+    first_job = store.create_job("+79991234567")
+    second_job = store.create_job("+79990000000")
+    assert store.start(first_job) is True
+    assert store.start(second_job) is True
+    claim = store.claim_next("worker-a")
+
+    store.defer_account_floodwait([claim], seconds=90)
+
+    reopened = QueueStore(database, now=clock)
+    assert reopened.snapshot(first_job)["state"] == "WAITING_RATE_LIMIT"
+    assert reopened.snapshot(first_job)["resume_after"] == 1_090.0
+    assert reopened.claim_next("worker-b") is None
+
+    clock.value += 91
+    resumed_claim = reopened.claim_next("worker-b")
+
+    assert resumed_claim["phone"] == "+79991234567"
+    assert reopened.snapshot(first_job)["state"] == "RUNNING"
+
+
+def test_malformed_json_keeps_source_and_enters_diagnostic_mode(tmp_path):
+    source = tmp_path / "jobs.json"
+    source.write_text("{bad json", encoding="utf-8")
+    store = QueueStore(tmp_path / "validator.db")
+
+    store.migrate_json(source)
+
+    diagnostic = store.migration_diagnostic()
+    assert source.read_text(encoding="utf-8") == "{bad json"
+    assert diagnostic["active"] is True
+    assert "не удалось" in diagnostic["message"].lower()

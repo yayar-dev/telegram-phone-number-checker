@@ -33,21 +33,40 @@ class TelethonGateway:
         return asyncio.run(run())
 
     def import_phones(self, phones: list[str]) -> dict[str, dict]:
-        return self._call(lambda client: upstream.get_names_batch(client, phones))
+        return self._call(
+            lambda client: upstream.get_names_batch(client, phones, cleanup_contacts=False)
+        )
 
     def resolve_phone(self, phone: str) -> dict:
         return self._call(lambda client: upstream.resolve_phone(client, phone))
+
+    def cleanup_contacts(self, user_ids: list[int]) -> None:
+        self._call(lambda client: upstream.cleanup_imported_contacts(client, user_ids))
 
 
 class DurableValidatorApplication:
     def __init__(self, database_path: Path, legacy_json_path: Path | None = None, gateway=None):
         self.store = QueueStore(database_path)
-        if legacy_json_path and legacy_json_path.exists():
-            self.store.migrate_json(legacy_json_path)
         self.gateway = gateway or TelethonGateway()
         self.owner = uuid4().hex
         self._worker = ValidatorWorker(self.store, self.gateway, self.owner)
-        Thread(target=self._run_worker, daemon=True).start()
+        self.startup_error = ""
+        self.worker_started = False
+        if legacy_json_path and legacy_json_path.exists():
+            try:
+                self.store.migrate_json(legacy_json_path)
+            except Exception as error:
+                self.startup_error = (
+                    "Не удалось перенести сохранённую очередь из JSON: "
+                    f"{error}. Исправьте или восстановите файл и перезапустите сервис."
+                )
+            else:
+                diagnostic = self.store.migration_diagnostic()
+                if diagnostic["active"]:
+                    self.startup_error = str(diagnostic["message"])
+        if not self.startup_error:
+            Thread(target=self._run_worker, daemon=True).start()
+            self.worker_started = True
 
     def _run_worker(self) -> None:
         while True:
@@ -78,8 +97,19 @@ class DurableValidatorApplication:
             "eta_seconds": None,
         }
 
+    def render_home_page(self) -> str:
+        return _render_page(error=self.startup_error, accept_jobs=not self.startup_error)
+
+    def render_job_page(self, job_id: str) -> str:
+        job = self.snapshot(job_id)
+        return (
+            _render_page(job=job, error=self.startup_error, accept_jobs=not self.startup_error)
+            if job
+            else ""
+        )
+
     def start(self, job_id: str) -> bool:
-        return self.store.start(job_id)
+        return not self.startup_error and self.store.start(job_id)
 
     def pause(self, job_id: str) -> bool:
         return self.store.pause(job_id)
@@ -121,17 +151,20 @@ class DurableValidatorApplication:
                     if not job:
                         self.send_error(404)
                         return
-                    self.send_content(web.render_page(job=job))
+                    self.send_content(application.render_job_page(job["id"]))
                     return
-                self.send_content(web.render_page())
+                self.send_content(application.render_home_page())
 
             def do_POST(self):
                 path = urlparse(self.path).path
                 length = int(self.headers.get("Content-Length", "0"))
                 values = parse_qs(self.rfile.read(length).decode("utf-8"))
                 if path == "/check":
+                    if application.startup_error:
+                        self.send_content(application.render_home_page())
+                        return
                     if values.get("queue_confirmation", [""])[0] != "yes":
-                        self.send_content(web.render_page(error="Нажмите «Поставить в очередь», чтобы сохранить список."))
+                        self.send_content(_render_page(error="Нажмите «Поставить в очередь», чтобы сохранить список."))
                         return
                     self.redirect(f"/jobs/{application.enqueue(values.get('phone_numbers', [''])[0])}")
                     return
@@ -154,3 +187,86 @@ class DurableValidatorApplication:
 
 def create_server(application: DurableValidatorApplication, port: int) -> ThreadingHTTPServer:
     return ThreadingHTTPServer(("127.0.0.1", port), application.handler())
+
+
+def _render_page(job: dict | None = None, error: str = "", accept_jobs: bool = True) -> str:
+    """Render the durable-queue UI without inheriting the legacy job controls."""
+    raw = job.get("raw", "") if job else ""
+    job_html = ""
+    results_html = ""
+    refresh_html = ""
+
+    if job:
+        state = job["state"]
+        processed = job["processed"]
+        total = job["total"]
+        message = html.escape(job.get("message", ""))
+        controls = ""
+        if state == "STAGED":
+            controls = _action_form(job["id"], "start", "Запустить обработку")
+        elif state == "PAUSED":
+            controls = (
+                _action_form(job["id"], "resume", "Возобновить обработку")
+                + _action_form(job["id"], "cancel", "Отменить обработку", secondary=True)
+            )
+        elif state in {"QUEUED", "RUNNING", "WAITING_RATE_LIMIT"}:
+            controls = (
+                _action_form(job["id"], "pause", "Приостановить")
+                + _action_form(job["id"], "cancel", "Отменить обработку", secondary=True)
+            )
+            refresh_html = '<meta http-equiv="refresh" content="2">'
+        waiting = ""
+        if job.get("waiting_until"):
+            remaining = max(0, round(job["waiting_until"] - time.time()))
+            waiting = (
+                f"<p>Ожидание Telegram: следующая попытка через {remaining // 60} мин. "
+                f"{remaining % 60} сек.</p>"
+            )
+        job_html = (
+            f"<p>Обработано номеров: {processed} из {total}.</p>"
+            f"<p>Найдено аккаунтов: {job.get('confirmed', 0)}.</p>"
+            f"{waiting}<p class=\"hint\">{message}</p>{controls}"
+        )
+        results_html = _render_results(job["rows"], processed, total, job["id"])
+
+    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    disabled = " disabled" if not accept_jobs else ""
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>Telegram validator</title>
+{refresh_html}
+<style>body{{font:16px system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 20px;color:#18212b}}textarea{{width:100%;min-height:220px;box-sizing:border-box;font:inherit}}button,.button{{display:inline-block;background:#276ef1;color:white;padding:10px 14px;border:0;border-radius:6px;text-decoration:none;font:inherit;cursor:pointer;margin-right:8px}}.secondary{{background:#667085}}label{{display:block;margin:16px 0 8px}}.hint{{color:#586574}}.error{{color:#b42318}}table{{border-collapse:collapse;width:100%;font-size:14px;margin-top:16px}}th,td{{border:1px solid #d0d5dd;padding:8px;text-align:left;vertical-align:top;word-break:break-word}}th{{background:#f2f4f7}}.action{{display:inline}}</style>
+</head><body><h1>Проверка номеров Telegram</h1>
+<p class="hint">Вставьте номера по одному в строке. Перед группой укажите компанию обычной строкой или как <code>[Название](https://example.com)</code>.</p>
+{error_html}<form id="queue-form" method="post" action="/check"><label for="phone_numbers">Компании и номера</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="ООО Пример&#10;+79991234567&#10;+447911123456"{disabled}>{html.escape(raw)}</textarea><input id="queue-confirmation" type="hidden" name="queue_confirmation" value=""><p><button id="queue-button" type="button"{disabled}>Поставить в очередь</button></p></form>{job_html}{results_html}
+<script>const form=document.getElementById('queue-form');const confirmation=document.getElementById('queue-confirmation');document.getElementById('queue-button').addEventListener('click',()=>{{confirmation.value='yes';form.requestSubmit();}});form.addEventListener('submit',(event)=>{{if(confirmation.value!=='yes')event.preventDefault();}});</script>
+</body></html>"""
+
+
+def _action_form(job_id: str, action: str, label: str, secondary: bool = False) -> str:
+    css_class = " secondary" if secondary else ""
+    return (
+        f'<form class="action" method="post" action="/jobs/{html.escape(job_id, quote=True)}/{action}">'
+        f'<button class="{css_class.strip()}" type="submit">{html.escape(label)}</button></form>'
+    )
+
+
+def _render_results(rows: list[dict[str, str]], processed: int, total: int, job_id: str) -> str:
+    if not rows:
+        return ""
+    headers = "".join(f"<th>{html.escape(field)}</th>" for field in web.ROW_FIELDS)
+    body = "".join(
+        "<tr>"
+        + "".join(
+            f"<td>{html.escape(row.get(field, ''))}</td>"
+            if field not in {"company_link", "telegram_link"} or not row.get(field)
+            else f'<td><a href="{html.escape(row[field], quote=True)}" target="_blank" rel="noreferrer">{html.escape(row[field])}</a></td>'
+            for field in web.ROW_FIELDS
+        )
+        + "</tr>"
+        for row in rows
+    )
+    return (
+        f"<p class=\"hint\">Показаны текущие строки: {processed} завершено из {total}.</p>"
+        f'<p><a class="button" href="/download.csv?job={html.escape(job_id, quote=True)}">Скачать текущий CSV</a></p>'
+        f"<table><thead><tr>{headers}</tr></thead><tbody>{body}</tbody></table>"
+    )

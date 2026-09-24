@@ -7,7 +7,104 @@ import asyncio
 import pytest
 
 from telegram_phone_number_checker import web
-from telegram_phone_number_checker.durable_web import DurableValidatorApplication
+from telegram_phone_number_checker.durable_web import DurableValidatorApplication, TelethonGateway
+
+
+class _BlockingGateway:
+    """Keeps one claimed item active so the durable UI can be inspected."""
+
+    def __init__(self):
+        from threading import Event
+
+        self.called = Event()
+        self.release = Event()
+
+    def import_phones(self, phones):
+        self.called.set()
+        self.release.wait(timeout=2)
+        return {phone: {"error": "No response"} for phone in phones}
+
+    def resolve_phone(self, phone):
+        return {"error": "No response"}
+
+
+def test_durable_gateway_defers_contact_cleanup_to_the_durable_worker(monkeypatch):
+    calls = []
+
+    class Client:
+        async def disconnect(self):
+            return None
+
+    async def login(*args):
+        return Client()
+
+    async def get_names_batch(client, phones, *, cleanup_contacts):
+        calls.append(("import", phones, cleanup_contacts))
+        return {phones[0]: {"id": 123, "_cleanup_contact_id": 123}}
+
+    async def cleanup_imported_contacts(client, user_ids):
+        calls.append(("cleanup", user_ids))
+
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
+    monkeypatch.setattr(web.upstream, "login", login)
+    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch, raising=False)
+    monkeypatch.setattr(web.upstream, "cleanup_imported_contacts", cleanup_imported_contacts, raising=False)
+
+    gateway = TelethonGateway()
+    gateway.import_phones(["+79991234567"])
+    gateway.cleanup_contacts([123])
+
+    assert calls == [
+        ("import", ["+79991234567"], False),
+        ("cleanup", [123]),
+    ]
+
+
+def test_durable_job_page_shows_partial_rows_counts_and_controls_while_running(tmp_path):
+    gateway = _BlockingGateway()
+    app = DurableValidatorApplication(tmp_path / "validator.db", gateway=gateway)
+    job_id = app.enqueue("+79991234567\n123")
+
+    assert app.start(job_id) is True
+    assert gateway.called.wait(timeout=2)
+
+    page = app.render_job_page(job_id)
+
+    assert "Обработано номеров: 1 из 2" in page
+    assert "INVALID_PHONE" in page
+    assert f'action="/jobs/{job_id}/pause"' in page
+    assert f'action="/jobs/{job_id}/cancel"' in page
+    assert "stop-deferred" not in page
+    gateway.release.set()
+
+
+def test_durable_paused_job_page_exposes_resume_and_cancel_controls(tmp_path):
+    app = DurableValidatorApplication(tmp_path / "validator.db")
+    job_id = app.enqueue("+79991234567")
+
+    assert app.start(job_id) is True
+    assert app.pause(job_id) is True
+
+    page = app.render_job_page(job_id)
+
+    assert f'action="/jobs/{job_id}/resume"' in page
+    assert f'action="/jobs/{job_id}/cancel"' in page
+    assert "stop-deferred" not in page
+
+
+def test_durable_application_surfaces_json_migration_failure_without_starting_worker(tmp_path):
+    legacy = tmp_path / "jobs.json"
+    legacy.write_text("{not json", encoding="utf-8")
+
+    app = DurableValidatorApplication(tmp_path / "validator.db", legacy_json_path=legacy)
+
+    assert app.startup_error
+    assert app.worker_started is False
+    page = app.render_home_page()
+    assert "не удалось перенести" in page.lower()
+    assert 'id="queue-button" type="button" disabled' in page
 
 
 def test_reads_custom_port_from_environment(monkeypatch):
