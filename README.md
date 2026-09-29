@@ -26,6 +26,23 @@ Open [http://127.0.0.1:8010](http://127.0.0.1:8010), paste companies and phone n
 
 The first launch migrates a previous `.validator-jobs.json` queue into `.validator.db` without changing the JSON source. The SQLite database contains phone numbers and is intentionally ignored by Git.
 
+## Personal Docker container
+
+To run the service only when you need it, use the `tg-validatorForSelf` container. Docker stores the Telegram session and validator queue in its named volume, so they remain available after the container is stopped.
+
+```bash
+docker compose up --build
+```
+
+On the first task launch, enter the Telegram login code in the same terminal if prompted. Then open [http://127.0.0.1:8010](http://127.0.0.1:8010). Stop and resume it with:
+
+```bash
+docker compose stop
+docker compose start
+```
+
+Use `TG_VALIDATOR_PORT=8011 docker compose up` if local port 8010 is already occupied.
+
 The status `NOT_FOUND_OR_PRIVACY_RESTRICTED` means Telegram did not return a contact match. It can mean there is no account or that the account cannot be found by phone number because of privacy settings.
 
 > ⚠️ NB: We advise you **not to use your personal account** for automations as telegram may block it. A fresh account works best from residential IPs rather than known VPN IPs.

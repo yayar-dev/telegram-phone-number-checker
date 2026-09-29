@@ -17,6 +17,11 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 
+def get_session_name(phone_number: str) -> str:
+    """Keep the Telethon authorization file in a caller-selected durable location."""
+    return os.getenv("TELEGRAM_SESSION_PATH") or phone_number
+
+
 def get_human_readable_user_status(status: types.TypeUserStatus):
     match status:
         case types.UserStatusOnline():
@@ -437,7 +442,7 @@ async def login(
     )
     PROXY = proxy or os.getenv("PROXY")
     client = TelegramClient(
-        PHONE_NUMBER,
+        get_session_name(PHONE_NUMBER),
         API_ID,
         API_HASH,
         proxy=parse_proxy(PROXY) if PROXY else None,

@@ -1,4 +1,5 @@
 from http.client import HTTPConnection
+from pathlib import Path
 from threading import Thread
 import time
 from urllib.parse import urlencode
@@ -834,3 +835,15 @@ def test_web_form_shows_authorization_problem_instead_of_dropping_response():
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_uses_durable_data_directory_from_environment(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_VALIDATOR_DATA_DIR", "/data")
+
+    assert web.get_data_dir() == Path("/data")
+
+
+def test_uses_configured_listen_host(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_VALIDATOR_HOST", "0.0.0.0")
+
+    assert web.get_host() == "0.0.0.0"

@@ -197,8 +197,10 @@ class DurableValidatorApplication:
         return RequestHandler
 
 
-def create_server(application: DurableValidatorApplication, port: int) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer(("127.0.0.1", port), application.handler())
+def create_server(
+    application: DurableValidatorApplication, port: int, host: str = "127.0.0.1"
+) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), application.handler())
 
 
 def _render_page(

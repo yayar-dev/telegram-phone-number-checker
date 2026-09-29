@@ -4,6 +4,12 @@ from telethon.tl import types
 from telegram_phone_number_checker import main
 
 
+def test_uses_persisted_session_path_from_environment(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_SESSION_PATH", "/data/telegram-session")
+
+    assert main.get_session_name("+79991234567") == "/data/telegram-session"
+
+
 class ImportedContact:
     def __init__(self, client_id, user_id):
         self.client_id = client_id

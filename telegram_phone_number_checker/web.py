@@ -745,6 +745,16 @@ def get_port() -> int:
     return port
 
 
+def get_data_dir() -> Path:
+    """Return the directory used for durable queue state."""
+    return Path(os.getenv("TELEGRAM_VALIDATOR_DATA_DIR", "."))
+
+
+def get_host() -> str:
+    """Return the interface on which the local web server listens."""
+    return os.getenv("TELEGRAM_VALIDATOR_HOST", "127.0.0.1")
+
+
 def main() -> None:
     from telegram_phone_number_checker.durable_web import (
         DurableValidatorApplication,
@@ -752,10 +762,14 @@ def main() -> None:
     )
 
     port = get_port()
+    data_dir = get_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
     server = create_durable_server(
         DurableValidatorApplication(
-            Path(".validator.db"), legacy_json_path=Path(".validator-jobs.json")
+            data_dir / ".validator.db",
+            legacy_json_path=data_dir / ".validator-jobs.json",
         ),
+        host=get_host(),
         port=port,
     )
     print(f"Откройте http://127.0.0.1:{port}")
