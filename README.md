@@ -34,7 +34,7 @@ To run the service only when you need it, use the `tg-validatorForSelf` containe
 docker compose up --build
 ```
 
-Then open [http://127.0.0.1:8010](http://127.0.0.1:8010), click **«Подключить Telegram»**, and enter the Telegram login code in the browser form. The code is used once and is not saved in the queue or CSV. Stop and resume the container with:
+Then open [http://127.0.0.1:8010](http://127.0.0.1:8010), enter the Telegram account number, then the Telegram login code, and, if enabled, the two-factor password. The number, code, and password are used only for the active authorization flow and are not saved in the queue or CSV. Stop and resume the container with:
 
 ```bash
 docker compose stop

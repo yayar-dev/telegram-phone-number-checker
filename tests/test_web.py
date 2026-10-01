@@ -57,6 +57,17 @@ class _AuthorizationClient:
         self.disconnected = True
 
 
+class _TwoFactorAuthorizationClient(_AuthorizationClient):
+    def __init__(self):
+        super().__init__()
+        self.password = ""
+
+    async def sign_in(self, phone=None, code=None, password=None):
+        if password is None:
+            raise web.upstream.errors.SessionPasswordNeededError(None)
+        self.password = password
+
+
 def test_telegram_authorization_accepts_code_from_web_memory(monkeypatch):
     monkeypatch.setenv("API_ID", "1")
     monkeypatch.setenv("API_HASH", "hash")
@@ -64,7 +75,7 @@ def test_telegram_authorization_accepts_code_from_web_memory(monkeypatch):
     client = _AuthorizationClient()
     authorization = TelegramAuthorization(client_factory=lambda *args, **kwargs: client)
 
-    assert authorization.begin() is True
+    assert authorization.begin("+79991112233") is True
     for _ in range(20):
         if authorization.snapshot()["state"] == "CODE_SENT":
             break
@@ -76,9 +87,36 @@ def test_telegram_authorization_accepts_code_from_web_memory(monkeypatch):
             break
         time.sleep(0.01)
 
-    assert client.code_requested == "+79990000000"
-    assert client.signed_in_with == ("+79990000000", "12345")
+    assert client.code_requested == "+79991112233"
+    assert client.signed_in_with == ("+79991112233", "12345")
     assert client.disconnected is True
+    assert authorization.snapshot()["state"] == "AUTHORIZED"
+
+
+def test_telegram_authorization_accepts_two_factor_password_from_web_memory(monkeypatch):
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    client = _TwoFactorAuthorizationClient()
+    authorization = TelegramAuthorization(client_factory=lambda *args, **kwargs: client)
+
+    assert authorization.begin("+79991112233") is True
+    for _ in range(20):
+        if authorization.snapshot()["state"] == "CODE_SENT":
+            break
+        time.sleep(0.01)
+    assert authorization.submit_code("12345") is True
+    for _ in range(20):
+        if authorization.snapshot()["state"] == "PASSWORD_REQUIRED":
+            break
+        time.sleep(0.01)
+    assert authorization.snapshot()["state"] == "PASSWORD_REQUIRED"
+    assert authorization.submit_password("secret-password") is True
+    for _ in range(20):
+        if authorization.snapshot()["state"] == "AUTHORIZED":
+            break
+        time.sleep(0.01)
+
+    assert client.password == "secret-password"
     assert authorization.snapshot()["state"] == "AUTHORIZED"
 
 
@@ -89,11 +127,50 @@ class _CodeSentAuthorization:
     def snapshot(self):
         return {"state": "CODE_SENT", "message": "Введите код из Telegram."}
 
-    def begin(self):
+    def begin(self, phone_number=None):
         return True
 
     def submit_code(self, code):
         self.submitted_codes.append(code)
+        return True
+
+    def submit_password(self, password):
+        return False
+
+
+class _NotAuthorizedAuthorization:
+    def __init__(self):
+        self.phone_numbers = []
+
+    def snapshot(self):
+        return {"state": "NOT_AUTHORIZED", "message": "Подключите Telegram."}
+
+    def begin(self, phone_number):
+        self.phone_numbers.append(phone_number)
+        return True
+
+    def submit_code(self, code):
+        return False
+
+    def submit_password(self, password):
+        return False
+
+
+class _PasswordAuthorization:
+    def __init__(self):
+        self.passwords = []
+
+    def snapshot(self):
+        return {"state": "PASSWORD_REQUIRED", "message": "Введите пароль 2FA."}
+
+    def begin(self, phone_number=None):
+        return False
+
+    def submit_code(self, code):
+        return False
+
+    def submit_password(self, password):
+        self.passwords.append(password)
         return True
 
 
@@ -101,11 +178,25 @@ class _AuthorizedAuthorization:
     def snapshot(self):
         return {"state": "AUTHORIZED", "message": "Telegram подключён."}
 
-    def begin(self):
+    def begin(self, phone_number=None):
         return False
 
     def submit_code(self, code):
         return False
+
+    def submit_password(self, password):
+        return False
+
+
+def test_durable_home_shows_telegram_phone_form_before_authorization(tmp_path):
+    app = DurableValidatorApplication(
+        tmp_path / "validator.db", authorization=_NotAuthorizedAuthorization()
+    )
+
+    page = app.render_home_page()
+
+    assert 'action="/auth/begin"' in page
+    assert 'name="phone_number"' in page
 
 
 def test_durable_home_shows_telegram_code_form_when_authorization_waits(tmp_path):
@@ -117,6 +208,17 @@ def test_durable_home_shows_telegram_code_form_when_authorization_waits(tmp_path
 
     assert "Введите код Telegram" in page
     assert 'action="/auth/code"' in page
+
+
+def test_durable_home_shows_two_factor_password_form_when_required(tmp_path):
+    app = DurableValidatorApplication(
+        tmp_path / "validator.db", authorization=_PasswordAuthorization()
+    )
+
+    page = app.render_home_page()
+
+    assert "пароль 2FA" in page
+    assert 'action="/auth/password"' in page
 
 
 def test_durable_web_submits_telegram_code_from_browser(tmp_path):
@@ -139,6 +241,58 @@ def test_durable_web_submits_telegram_code_from_browser(tmp_path):
         assert response.status == 303
         assert response.getheader("Location") == "/"
         assert authorization.submitted_codes == ["12345"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_durable_web_submits_telegram_phone_from_browser(tmp_path):
+    authorization = _NotAuthorizedAuthorization()
+    app = DurableValidatorApplication(tmp_path / "validator.db", authorization=authorization)
+    server = create_durable_server(app, port=0)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port)
+        connection.request(
+            "POST",
+            "/auth/begin",
+            body=urlencode({"phone_number": "+79991112233"}),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response = connection.getresponse()
+        response.read()
+
+        assert response.status == 303
+        assert response.getheader("Location") == "/"
+        assert authorization.phone_numbers == ["+79991112233"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_durable_web_submits_two_factor_password_from_browser(tmp_path):
+    authorization = _PasswordAuthorization()
+    app = DurableValidatorApplication(tmp_path / "validator.db", authorization=authorization)
+    server = create_durable_server(app, port=0)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port)
+        connection.request(
+            "POST",
+            "/auth/password",
+            body=urlencode({"password": "secret-password"}),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response = connection.getresponse()
+        response.read()
+
+        assert response.status == 303
+        assert response.getheader("Location") == "/"
+        assert authorization.passwords == ["secret-password"]
     finally:
         server.shutdown()
         server.server_close()

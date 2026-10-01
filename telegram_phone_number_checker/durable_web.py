@@ -16,6 +16,7 @@ from telegram_phone_number_checker import main as upstream
 from telegram_phone_number_checker import web
 from telegram_phone_number_checker.queue_store import QueueStore
 from telegram_phone_number_checker.validator_worker import ValidatorWorker
+from telegram_phone_number_checker.web_service import is_valid_phone, normalize_phone_line
 
 
 class TelegramAuthorization:
@@ -25,7 +26,10 @@ class TelegramAuthorization:
         self._client_factory = client_factory or upstream.TelegramClient
         self._lock = Lock()
         self._code_ready = Event()
+        self._password_ready = Event()
         self._code = ""
+        self._password = ""
+        self._phone_number = ""
         self._state = "NOT_AUTHORIZED"
         self._message = "Подключите Telegram, чтобы получить код авторизации."
 
@@ -33,15 +37,33 @@ class TelegramAuthorization:
         with self._lock:
             return {"state": self._state, "message": self._message}
 
-    def begin(self) -> bool:
+    def begin(self, phone_number: str | None = None) -> bool:
+        phone_number = normalize_phone_line(phone_number or os.getenv("PHONE_NUMBER", ""))
+        if not is_valid_phone(phone_number):
+            self._set_state("ERROR", "Введите номер Telegram в международном формате, например +79991234567.")
+            return False
         with self._lock:
-            if self._state in {"REQUESTING_CODE", "CODE_SENT"}:
+            if self._state in {"REQUESTING_CODE", "CODE_SENT", "PASSWORD_REQUIRED"}:
                 return False
             self._state = "REQUESTING_CODE"
             self._message = "Запрашиваем код у Telegram…"
             self._code = ""
+            self._password = ""
+            self._phone_number = phone_number
             self._code_ready.clear()
+            self._password_ready.clear()
         Thread(target=self._authorize, name="telegram-authorization", daemon=True).start()
+        return True
+
+    def submit_password(self, password: str) -> bool:
+        if not password:
+            return False
+        with self._lock:
+            if self._state != "PASSWORD_REQUIRED":
+                return False
+            self._password = password
+            self._message = "Проверяем пароль 2FA…"
+            self._password_ready.set()
         return True
 
     def submit_code(self, code: str) -> bool:
@@ -70,7 +92,8 @@ class TelegramAuthorization:
     async def _authorize_async(self) -> None:
         api_id = os.getenv("API_ID")
         api_hash = os.getenv("API_HASH")
-        phone_number = os.getenv("PHONE_NUMBER")
+        with self._lock:
+            phone_number = self._phone_number
         if not api_id or not api_hash or not phone_number:
             self._set_state("ERROR", "Не заданы API_ID, API_HASH или PHONE_NUMBER в .env.")
             return
@@ -93,7 +116,15 @@ class TelegramAuthorization:
             with self._lock:
                 code = self._code
                 self._code = ""
-            await client.sign_in(phone_number, code)
+            try:
+                await client.sign_in(phone_number, code)
+            except upstream.errors.SessionPasswordNeededError:
+                self._set_state("PASSWORD_REQUIRED", "Введите пароль двухэтапной аутентификации.")
+                await asyncio.to_thread(self._password_ready.wait)
+                with self._lock:
+                    password = self._password
+                    self._password = ""
+                await client.sign_in(password=password)
             self._set_state("AUTHORIZED", "Telegram подключён.")
         finally:
             await client.disconnect()
@@ -215,11 +246,14 @@ class DurableValidatorApplication:
         self.store.cancel(job_id)
         return True
 
-    def begin_authorization(self) -> bool:
-        return self.authorization.begin()
+    def begin_authorization(self, phone_number: str) -> bool:
+        return self.authorization.begin(phone_number)
 
     def submit_authorization_code(self, code: str) -> bool:
         return self.authorization.submit_code(code)
+
+    def submit_authorization_password(self, password: str) -> bool:
+        return self.authorization.submit_password(password)
 
     def confirm_manual_chat(self, job_id: str, item_id: str) -> bool:
         return self.store.confirm_manual_chat(job_id, item_id)
@@ -266,11 +300,15 @@ class DurableValidatorApplication:
                 length = int(self.headers.get("Content-Length", "0"))
                 values = parse_qs(self.rfile.read(length).decode("utf-8"))
                 if path == "/auth/begin":
-                    application.begin_authorization()
+                    application.begin_authorization(values.get("phone_number", [""])[0])
                     self.redirect("/")
                     return
                 if path == "/auth/code":
                     application.submit_authorization_code(values.get("code", [""])[0])
+                    self.redirect("/")
+                    return
+                if path == "/auth/password":
+                    application.submit_authorization_password(values.get("password", [""])[0])
                     self.redirect("/")
                     return
                 if path == "/check":
@@ -415,11 +453,20 @@ def _render_authorization(authorization: dict[str, str]) -> str:
             '<input id="telegram-code" name="code" inputmode="numeric" autocomplete="one-time-code" required>'
             '<p><button type="submit">Подтвердить код</button></p></form>'
         )
+    if state == "PASSWORD_REQUIRED":
+        return (
+            f'<p class="hint">{message}</p><form method="post" action="/auth/password">'
+            '<label for="telegram-password">Введите пароль 2FA</label>'
+            '<input id="telegram-password" name="password" type="password" autocomplete="current-password" required>'
+            '<p><button type="submit">Подтвердить пароль</button></p></form>'
+        )
     if state == "REQUESTING_CODE":
         return f'<p class="hint">{message}</p><meta http-equiv="refresh" content="2">'
     return (
         f'<p class="hint">{message}</p><form method="post" action="/auth/begin">'
-        '<button type="submit">Подключить Telegram</button></form>'
+        '<label for="telegram-phone">Номер Telegram</label>'
+        '<input id="telegram-phone" name="phone_number" inputmode="tel" autocomplete="tel" placeholder="+79991234567" required>'
+        '<p><button type="submit">Получить код Telegram</button></p></form>'
     )
 
 
