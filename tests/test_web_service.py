@@ -59,8 +59,9 @@ def test_parses_plain_company_names_without_links():
     ]
 
 
-def test_rejects_phone_without_international_prefix():
-    assert is_valid_phone("79991234567") is False
+def test_normalizes_russian_phone_without_plus_prefix():
+    assert parse_phone_batch("79151054401") == ["+79151054401"]
+    assert is_valid_phone("+79151054401") is True
 
 
 def test_rejects_phone_with_extension_instead_of_changing_its_digits():

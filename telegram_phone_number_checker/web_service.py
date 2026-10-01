@@ -19,7 +19,9 @@ def normalize_phone_line(line: str) -> str:
     if any(character.isalpha() for character in stripped):
         return stripped
     digits = "".join(character for character in stripped if character.isdigit())
-    return f"+{digits}" if stripped.startswith("+") else stripped
+    if stripped.startswith("+") or (len(digits) == 11 and digits.startswith("7")):
+        return f"+{digits}"
+    return stripped
 
 
 def parse_company_phone_batch(raw: str, deduplicate: bool = True) -> list[dict[str, str]]:

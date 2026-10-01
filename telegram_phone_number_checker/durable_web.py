@@ -8,7 +8,7 @@ import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Event, Lock, Thread
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -16,6 +16,87 @@ from telegram_phone_number_checker import main as upstream
 from telegram_phone_number_checker import web
 from telegram_phone_number_checker.queue_store import QueueStore
 from telegram_phone_number_checker.validator_worker import ValidatorWorker
+
+
+class TelegramAuthorization:
+    """One-time web authorization flow; submitted codes stay only in memory."""
+
+    def __init__(self, client_factory=None):
+        self._client_factory = client_factory or upstream.TelegramClient
+        self._lock = Lock()
+        self._code_ready = Event()
+        self._code = ""
+        self._state = "NOT_AUTHORIZED"
+        self._message = "Подключите Telegram, чтобы получить код авторизации."
+
+    def snapshot(self) -> dict[str, str]:
+        with self._lock:
+            return {"state": self._state, "message": self._message}
+
+    def begin(self) -> bool:
+        with self._lock:
+            if self._state in {"REQUESTING_CODE", "CODE_SENT"}:
+                return False
+            self._state = "REQUESTING_CODE"
+            self._message = "Запрашиваем код у Telegram…"
+            self._code = ""
+            self._code_ready.clear()
+        Thread(target=self._authorize, name="telegram-authorization", daemon=True).start()
+        return True
+
+    def submit_code(self, code: str) -> bool:
+        clean_code = "".join(character for character in code if character.isdigit())
+        if not clean_code:
+            return False
+        with self._lock:
+            if self._state != "CODE_SENT":
+                return False
+            self._code = clean_code
+            self._message = "Проверяем код Telegram…"
+            self._code_ready.set()
+        return True
+
+    def _set_state(self, state: str, message: str) -> None:
+        with self._lock:
+            self._state = state
+            self._message = message
+
+    def _authorize(self) -> None:
+        try:
+            asyncio.run(self._authorize_async())
+        except Exception as error:
+            self._set_state("ERROR", f"Не удалось авторизовать Telegram: {error}")
+
+    async def _authorize_async(self) -> None:
+        api_id = os.getenv("API_ID")
+        api_hash = os.getenv("API_HASH")
+        phone_number = os.getenv("PHONE_NUMBER")
+        if not api_id or not api_hash or not phone_number:
+            self._set_state("ERROR", "Не заданы API_ID, API_HASH или PHONE_NUMBER в .env.")
+            return
+        proxy = os.getenv("PROXY")
+        client = self._client_factory(
+            upstream.get_session_name(phone_number),
+            api_id,
+            api_hash,
+            proxy=upstream.parse_proxy(proxy) if proxy else None,
+            flood_sleep_threshold=0,
+        )
+        try:
+            await client.connect()
+            if await client.is_user_authorized():
+                self._set_state("AUTHORIZED", "Telegram подключён.")
+                return
+            await client.send_code_request(phone_number)
+            self._set_state("CODE_SENT", "Введите код из Telegram.")
+            await asyncio.to_thread(self._code_ready.wait)
+            with self._lock:
+                code = self._code
+                self._code = ""
+            await client.sign_in(phone_number, code)
+            self._set_state("AUTHORIZED", "Telegram подключён.")
+        finally:
+            await client.disconnect()
 
 
 class TelethonGateway:
@@ -45,9 +126,12 @@ class TelethonGateway:
 
 
 class DurableValidatorApplication:
-    def __init__(self, database_path: Path, legacy_json_path: Path | None = None, gateway=None):
+    def __init__(
+        self, database_path: Path, legacy_json_path: Path | None = None, gateway=None, authorization=None
+    ):
         self.store = QueueStore(database_path)
         self.gateway = gateway or TelethonGateway()
+        self.authorization = authorization or TelegramAuthorization()
         self.owner = uuid4().hex
         self._worker = ValidatorWorker(self.store, self.gateway, self.owner)
         self.startup_error = ""
@@ -101,18 +185,28 @@ class DurableValidatorApplication:
             error=self.startup_error,
             accept_jobs=not self.startup_error,
             jobs=self.store.list_jobs(),
+            authorization=self.authorization.snapshot(),
         )
 
     def render_job_page(self, job_id: str) -> str:
         job = self.snapshot(job_id)
         return (
-            _render_page(job=job, error=self.startup_error, accept_jobs=not self.startup_error)
+            _render_page(
+                job=job,
+                error=self.startup_error,
+                accept_jobs=not self.startup_error,
+                authorization=self.authorization.snapshot(),
+            )
             if job
             else ""
         )
 
     def start(self, job_id: str) -> bool:
-        return not self.startup_error and self.store.start(job_id)
+        return (
+            not self.startup_error
+            and self.authorization.snapshot()["state"] == "AUTHORIZED"
+            and self.store.start(job_id)
+        )
 
     def pause(self, job_id: str) -> bool:
         return self.store.pause(job_id)
@@ -120,6 +214,12 @@ class DurableValidatorApplication:
     def cancel(self, job_id: str) -> bool:
         self.store.cancel(job_id)
         return True
+
+    def begin_authorization(self) -> bool:
+        return self.authorization.begin()
+
+    def submit_authorization_code(self, code: str) -> bool:
+        return self.authorization.submit_code(code)
 
     def confirm_manual_chat(self, job_id: str, item_id: str) -> bool:
         return self.store.confirm_manual_chat(job_id, item_id)
@@ -165,6 +265,14 @@ class DurableValidatorApplication:
                 path = urlparse(self.path).path
                 length = int(self.headers.get("Content-Length", "0"))
                 values = parse_qs(self.rfile.read(length).decode("utf-8"))
+                if path == "/auth/begin":
+                    application.begin_authorization()
+                    self.redirect("/")
+                    return
+                if path == "/auth/code":
+                    application.submit_authorization_code(values.get("code", [""])[0])
+                    self.redirect("/")
+                    return
                 if path == "/check":
                     if application.startup_error:
                         self.send_content(application.render_home_page())
@@ -205,6 +313,7 @@ def create_server(
 
 def _render_page(
     job: dict | None = None, error: str = "", accept_jobs: bool = True, jobs: list[dict] | None = None,
+    authorization: dict[str, str] | None = None,
 ) -> str:
     """Render the durable-queue UI without inheriting the legacy job controls."""
     raw = job.get("raw", "") if job else ""
@@ -212,6 +321,8 @@ def _render_page(
     results_html = ""
     refresh_html = ""
     queues_html = ""
+    authorization = authorization or {"state": "NOT_AUTHORIZED", "message": ""}
+    authorization_html = _render_authorization(authorization)
 
     if job:
         state = job["state"]
@@ -220,7 +331,11 @@ def _render_page(
         message = html.escape(job.get("message", ""))
         controls = ""
         if state == "STAGED":
-            controls = _action_form(job["id"], "start", "Запустить обработку")
+            controls = (
+                _action_form(job["id"], "start", "Запустить обработку")
+                if authorization["state"] == "AUTHORIZED"
+                else "<p class=\"hint\">Авторизуйте Telegram перед запуском обработки.</p>"
+            )
         elif state == "PAUSED":
             controls = (
                 _action_form(job["id"], "resume", "Возобновить обработку")
@@ -283,9 +398,29 @@ def _render_page(
 <style>body{{font:16px system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 20px;color:#18212b}}textarea{{width:100%;min-height:220px;box-sizing:border-box;font:inherit}}button,.button{{display:inline-block;background:#276ef1;color:white;padding:10px 14px;border:0;border-radius:6px;text-decoration:none;font:inherit;cursor:pointer;margin-right:8px}}.secondary{{background:#667085}}label{{display:block;margin:16px 0 8px}}.hint{{color:#586574}}.error{{color:#b42318}}table{{border-collapse:collapse;width:100%;font-size:14px;margin-top:16px}}th,td{{border:1px solid #d0d5dd;padding:8px;text-align:left;vertical-align:top;word-break:break-word}}th{{background:#f2f4f7}}.action{{display:inline}}</style>
 </head><body><h1>Проверка номеров Telegram</h1>
 <p class="hint">Вставьте номера по одному в строке. Перед группой укажите компанию обычной строкой или как <code>[Название](https://example.com)</code>.</p>
-   {error_html}<form id="queue-form" method="post" action="/check"><label for="phone_numbers">Компании и номера</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="ООО Пример&#10;+79991234567&#10;+447911123456"{disabled}>{html.escape(raw)}</textarea><input id="queue-confirmation" type="hidden" name="queue_confirmation" value=""><p><button id="queue-button" type="button"{disabled}>Поставить в очередь</button></p></form>{queues_html}{job_html}{results_html}
+   {error_html}{authorization_html}<form id="queue-form" method="post" action="/check"><label for="phone_numbers">Компании и номера</label><textarea id="phone_numbers" name="phone_numbers" required placeholder="ООО Пример&#10;+79991234567&#10;+447911123456"{disabled}>{html.escape(raw)}</textarea><input id="queue-confirmation" type="hidden" name="queue_confirmation" value=""><p><button id="queue-button" type="button"{disabled}>Поставить в очередь</button></p></form>{queues_html}{job_html}{results_html}
 <script>const form=document.getElementById('queue-form');const confirmation=document.getElementById('queue-confirmation');document.getElementById('queue-button').addEventListener('click',()=>{{confirmation.value='yes';form.requestSubmit();}});form.addEventListener('submit',(event)=>{{if(confirmation.value!=='yes')event.preventDefault();}});</script>
 </body></html>"""
+
+
+def _render_authorization(authorization: dict[str, str]) -> str:
+    state = authorization.get("state", "NOT_AUTHORIZED")
+    message = html.escape(authorization.get("message", ""))
+    if state == "AUTHORIZED":
+        return f'<p class="hint">{message}</p>'
+    if state == "CODE_SENT":
+        return (
+            f'<p class="hint">{message}</p><form method="post" action="/auth/code">'
+            '<label for="telegram-code">Введите код Telegram</label>'
+            '<input id="telegram-code" name="code" inputmode="numeric" autocomplete="one-time-code" required>'
+            '<p><button type="submit">Подтвердить код</button></p></form>'
+        )
+    if state == "REQUESTING_CODE":
+        return f'<p class="hint">{message}</p><meta http-equiv="refresh" content="2">'
+    return (
+        f'<p class="hint">{message}</p><form method="post" action="/auth/begin">'
+        '<button type="submit">Подключить Telegram</button></form>'
+    )
 
 
 def _action_form(job_id: str, action: str, label: str, secondary: bool = False) -> str:

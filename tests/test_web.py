@@ -8,7 +8,12 @@ import asyncio
 import pytest
 
 from telegram_phone_number_checker import web
-from telegram_phone_number_checker.durable_web import DurableValidatorApplication, TelethonGateway
+from telegram_phone_number_checker.durable_web import (
+    DurableValidatorApplication,
+    TelegramAuthorization,
+    TelethonGateway,
+    create_server as create_durable_server,
+)
 from telegram_phone_number_checker.queue_store import QueueStore
 
 
@@ -28,6 +33,116 @@ class _BlockingGateway:
 
     def resolve_phone(self, phone):
         return {"error": "No response"}
+
+
+class _AuthorizationClient:
+    def __init__(self):
+        self.code_requested = False
+        self.signed_in_with = ""
+        self.disconnected = False
+
+    async def connect(self):
+        return None
+
+    async def is_user_authorized(self):
+        return False
+
+    async def send_code_request(self, phone):
+        self.code_requested = phone
+
+    async def sign_in(self, phone, code):
+        self.signed_in_with = (phone, code)
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
+def test_telegram_authorization_accepts_code_from_web_memory(monkeypatch):
+    monkeypatch.setenv("API_ID", "1")
+    monkeypatch.setenv("API_HASH", "hash")
+    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
+    client = _AuthorizationClient()
+    authorization = TelegramAuthorization(client_factory=lambda *args, **kwargs: client)
+
+    assert authorization.begin() is True
+    for _ in range(20):
+        if authorization.snapshot()["state"] == "CODE_SENT":
+            break
+        time.sleep(0.01)
+    assert authorization.snapshot()["state"] == "CODE_SENT"
+    assert authorization.submit_code("12345") is True
+    for _ in range(20):
+        if authorization.snapshot()["state"] == "AUTHORIZED":
+            break
+        time.sleep(0.01)
+
+    assert client.code_requested == "+79990000000"
+    assert client.signed_in_with == ("+79990000000", "12345")
+    assert client.disconnected is True
+    assert authorization.snapshot()["state"] == "AUTHORIZED"
+
+
+class _CodeSentAuthorization:
+    def __init__(self):
+        self.submitted_codes = []
+
+    def snapshot(self):
+        return {"state": "CODE_SENT", "message": "Введите код из Telegram."}
+
+    def begin(self):
+        return True
+
+    def submit_code(self, code):
+        self.submitted_codes.append(code)
+        return True
+
+
+class _AuthorizedAuthorization:
+    def snapshot(self):
+        return {"state": "AUTHORIZED", "message": "Telegram подключён."}
+
+    def begin(self):
+        return False
+
+    def submit_code(self, code):
+        return False
+
+
+def test_durable_home_shows_telegram_code_form_when_authorization_waits(tmp_path):
+    app = DurableValidatorApplication(
+        tmp_path / "validator.db", authorization=_CodeSentAuthorization()
+    )
+
+    page = app.render_home_page()
+
+    assert "Введите код Telegram" in page
+    assert 'action="/auth/code"' in page
+
+
+def test_durable_web_submits_telegram_code_from_browser(tmp_path):
+    authorization = _CodeSentAuthorization()
+    app = DurableValidatorApplication(tmp_path / "validator.db", authorization=authorization)
+    server = create_durable_server(app, port=0)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port)
+        connection.request(
+            "POST",
+            "/auth/code",
+            body=urlencode({"code": "12345"}),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response = connection.getresponse()
+        response.read()
+
+        assert response.status == 303
+        assert response.getheader("Location") == "/"
+        assert authorization.submitted_codes == ["12345"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_durable_gateway_defers_contact_cleanup_to_the_durable_worker(monkeypatch):
@@ -66,7 +181,9 @@ def test_durable_gateway_defers_contact_cleanup_to_the_durable_worker(monkeypatc
 
 def test_durable_job_page_shows_partial_rows_counts_and_controls_while_running(tmp_path):
     gateway = _BlockingGateway()
-    app = DurableValidatorApplication(tmp_path / "validator.db", gateway=gateway)
+    app = DurableValidatorApplication(
+        tmp_path / "validator.db", gateway=gateway, authorization=_AuthorizedAuthorization()
+    )
     job_id = app.enqueue("+79991234567\n123")
 
     assert app.start(job_id) is True
@@ -86,7 +203,7 @@ def test_durable_job_page_shows_partial_rows_counts_and_controls_while_running(t
 
 
 def test_durable_paused_job_page_exposes_resume_and_cancel_controls(tmp_path):
-    app = DurableValidatorApplication(tmp_path / "validator.db")
+    app = DurableValidatorApplication(tmp_path / "validator.db", authorization=_AuthorizedAuthorization())
     job_id = app.enqueue("+79991234567")
 
     assert app.start(job_id) is True
@@ -118,12 +235,34 @@ def test_reads_custom_port_from_environment(monkeypatch):
 
 
 def test_durable_web_stages_job_until_explicit_start(tmp_path):
-    app = DurableValidatorApplication(tmp_path / "validator.db")
+    app = DurableValidatorApplication(tmp_path / "validator.db", authorization=_AuthorizedAuthorization())
 
     job_id = app.enqueue("+79991234567")
 
     assert app.snapshot(job_id)["started"] is False
     assert app.start(job_id) is True
+
+
+def test_durable_web_keeps_job_staged_until_telegram_is_authorized(tmp_path):
+    app = DurableValidatorApplication(
+        tmp_path / "validator.db", authorization=_CodeSentAuthorization()
+    )
+    job_id = app.enqueue("+79991234567")
+
+    assert app.start(job_id) is False
+    assert app.snapshot(job_id)["started"] is False
+
+
+def test_staged_job_shows_authorization_requirement_before_start(tmp_path):
+    app = DurableValidatorApplication(
+        tmp_path / "validator.db", authorization=_CodeSentAuthorization()
+    )
+    job_id = app.enqueue("+79991234567")
+
+    page = app.render_job_page(job_id)
+
+    assert "Авторизуйте Telegram перед запуском обработки." in page
+    assert f'action="/jobs/{job_id}/start"' not in page
 
 
 def test_durable_home_page_lists_a_staged_queue(tmp_path):
