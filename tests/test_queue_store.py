@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from telegram_phone_number_checker.queue_store import QueueStore
 
 
@@ -412,3 +414,65 @@ def test_only_actual_failure_counts_toward_terminal_retry_limit(tmp_path):
         clock.value += delay
     with store._connect() as connection:
         assert connection.execute('SELECT attempts FROM job_items').fetchone()[0] == 3
+
+
+@pytest.mark.parametrize('state', ['PAUSED', 'WAITING_AUTHORIZATION'])
+@pytest.mark.parametrize('operation', ['IMPORT', 'CLEANUP'])
+def test_late_floodwait_preserves_explicit_pause_across_deadline(tmp_path, state, operation):
+    clock = Clock()
+    store = QueueStore(tmp_path / 'validator.db', now=clock)
+    job_id = store.create_job('+79991234567')
+    store.start(job_id)
+    claim = store.claim_next('worker')
+    if operation == 'CLEANUP':
+        store.finish_claim(claim, {'id': 123})
+        claim = store.claim_cleanup_batch('worker', 10)
+    if state == 'PAUSED':
+        assert store.pause(job_id)
+    else:
+        with store._connect() as connection:
+            connection.execute("UPDATE jobs SET state = 'WAITING_AUTHORIZATION', message = 'Explicit authorization wait' WHERE id = ?", (job_id,))
+    if operation == 'IMPORT':
+        store.defer_account_floodwait([claim], 230)
+    else:
+        store.defer_cleanup_floodwait(claim, 230)
+    assert store.snapshot(job_id)['state'] == state
+    assert store.snapshot(job_id)['resume_after'] == 1230
+    clock.value = 1300
+    reopened = QueueStore(store.path, now=clock)
+    reopened.reconcile()
+    assert reopened.snapshot(job_id)['state'] == state
+    assert reopened.claim_next('worker-b') is None
+    assert reopened.claim_cleanup_batch('worker-b', 10) is None
+
+
+@pytest.mark.parametrize('result', [
+    {'error': 'LEGACY_OTP_91234_2FA_DISTINCTIVE_TEST_MARKER'},
+    {'skipped': True, 'error': 'LEGACY_OTP_91234_2FA_DISTINCTIVE_TEST_MARKER'},
+    {'error': 'No response LEGACY_OTP_91234_2FA_DISTINCTIVE_TEST_MARKER'},
+])
+def test_json_migration_never_copies_raw_auth_errors_into_database(tmp_path, result):
+    store = QueueStore(tmp_path / 'validator.db')
+    source = tmp_path / 'jobs.json'
+    source.write_text(json.dumps({'jobs': {'legacy': {'raw': '+79991234567', 'results_by_phone': {'+79991234567': result}}}}))
+    store.migrate_json(source)
+    with store._connect() as connection:
+        dumped_database = '\n'.join(connection.iterdump())
+        history = str([dict(row) for row in connection.execute('SELECT * FROM job_item_attempts')])
+    assert 'LEGACY_OTP_91234_2FA_DISTINCTIVE_TEST_MARKER' not in dumped_database
+    assert 'LEGACY_OTP_91234_2FA_DISTINCTIVE_TEST_MARKER' not in history
+    assert 'LEGACY_OTP_91234_2FA_DISTINCTIVE_TEST_MARKER' in source.read_text()
+
+
+def test_repeated_import_response_commit_does_not_double_count_batch(tmp_path):
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = store.create_job('+79991234567')
+    store.start(job_id)
+    claims = store.claim_batch('worker', 10)
+    result = {claims[0]['phone']: {'id': 123}}
+    store.finish_import_batch(claims, result)
+    store.finish_import_batch(claims, result)
+    assert store.snapshot(job_id)['import_success_streak'] == 1
+    with store._connect() as connection:
+        assert connection.execute('SELECT import_batches_since_cleanup FROM worker_state').fetchone()[0] == 1
+        assert connection.execute('SELECT COUNT(*) FROM job_item_attempts').fetchone()[0] == 1

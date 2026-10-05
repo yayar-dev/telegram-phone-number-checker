@@ -169,35 +169,40 @@ class QueueStore:
             (claim["id"], claim["job_id"], claim["phone"]),
         ).fetchall()
 
-    def defer_import_retries(self, claims: list[dict], reason: str) -> None:
+    def defer_import_retries(
+        self, claims: list[dict], reason: str, *, connection: sqlite3.Connection | None = None,
+    ) -> None:
         """Keep retry_contacts in IMPORT with a persisted per-phone retry schedule."""
         if not claims:
             return
+        if connection is None:
+            with self._connect() as owned_connection:
+                owned_connection.execute('BEGIN IMMEDIATE')
+                self.defer_import_retries(claims, reason, connection=owned_connection)
+                owned_connection.commit()
+            return
         timestamp = self.now()
         detail = 'Telegram отложил импорт; номер сохранён для повторного импорта.'
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            changed_jobs = set()
-            for claim in claims:
-                for row in self._claim_and_duplicates(connection, claim):
-                    retry_number = row['import_retry_count'] + 1
-                    delay = (60, 300, 900)[min(retry_number - 1, 2)]
-                    self.record_item_attempt(row['id'], 'IMPORT', 'IMPORT_RETRY', detail, connection=connection)
-                    connection.execute(
-                        """UPDATE job_items SET status = 'PENDING_RETRY', method = 'IMPORT', detail = ?,
-                           import_retry_count = ?, next_attempt_at = ?, lease_owner = NULL,
-                           lease_expires_at = NULL WHERE id = ?""",
-                        (detail, retry_number, timestamp + delay, row['id']),
-                    )
-                    changed_jobs.add(claim['job_id'])
-            for job_id in changed_jobs:
+        changed_jobs = set()
+        for claim in claims:
+            for row in self._claim_and_duplicates(connection, claim):
+                retry_number = row['import_retry_count'] + 1
+                delay = (60, 300, 900)[min(retry_number - 1, 2)]
+                self.record_item_attempt(row['id'], 'IMPORT', 'IMPORT_RETRY', detail, connection=connection)
                 connection.execute(
-                    "UPDATE jobs SET import_retry_count = import_retry_count + 1, import_success_streak = 0, updated_at = ? WHERE id = ?",
-                    (timestamp, job_id),
+                    """UPDATE job_items SET status = 'PENDING_RETRY', method = 'IMPORT', detail = ?,
+                       import_retry_count = ?, next_attempt_at = ?, lease_owner = NULL,
+                       lease_expires_at = NULL WHERE id = ?""",
+                    (detail, retry_number, timestamp + delay, row['id']),
                 )
-                self._event(connection, job_id, 'IMPORT_RETRY', detail)
-            self._release_account(connection, claims[0])
-            connection.commit()
+                changed_jobs.add(claim['job_id'])
+        for job_id in changed_jobs:
+            connection.execute(
+                "UPDATE jobs SET import_retry_count = import_retry_count + 1, import_success_streak = 0, updated_at = ? WHERE id = ?",
+                (timestamp, job_id),
+            )
+            self._event(connection, job_id, 'IMPORT_RETRY', detail)
+        self._release_account(connection, claims[0])
 
     def defer_unknown_outcome(self, claims: list[dict], method: str) -> None:
         """Quarantine a possibly dispatched request until explicit operator review."""
@@ -248,22 +253,20 @@ class QueueStore:
         self._release_account(connection, claim)
         self._event(connection, claim['job_id'], 'WAITING_AUTHORIZATION', 'Требуется авторизация Telegram; затем явное возобновление.')
 
-    def record_import_batch_success(self, job_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """UPDATE jobs SET import_batch_size = CASE WHEN import_success_streak >= 4
-                       THEN CASE import_batch_size WHEN 1 THEN 5 ELSE 10 END ELSE import_batch_size END,
-                   import_success_streak = CASE WHEN import_success_streak >= 4 THEN 0 ELSE import_success_streak + 1 END,
-                   updated_at = ? WHERE id = ?""",
-                (self.now(), job_id),
-            )
-
-    def record_import_batch_completed(self, account_key: str = 'default') -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE worker_state SET import_batches_since_cleanup = import_batches_since_cleanup + 1 WHERE account_key = ?",
-                (account_key,),
-            )
+    def record_import_batch_success(
+        self, job_id: str, *, connection: sqlite3.Connection | None = None,
+    ) -> None:
+        if connection is None:
+            with self._connect() as owned_connection:
+                self.record_import_batch_success(job_id, connection=owned_connection)
+            return
+        connection.execute(
+            """UPDATE jobs SET import_batch_size = CASE WHEN import_success_streak >= 4
+                   THEN CASE import_batch_size WHEN 1 THEN 5 ELSE 10 END ELSE import_batch_size END,
+               import_success_streak = CASE WHEN import_success_streak >= 4 THEN 0 ELSE import_success_streak + 1 END,
+               updated_at = ? WHERE id = ?""",
+            (self.now(), job_id),
+        )
 
     def cleanup_due(self, account_key: str = 'default') -> bool:
         with self._connect() as connection:
@@ -347,7 +350,7 @@ class QueueStore:
                     if not is_valid_phone(phone):
                         status, method, detail = "INVALID_PHONE", "NONE", "Введите номер в международном формате, например +79991234567."
                     elif result.get("skipped") or (skip_deferred and phone in deferred):
-                        status, method, detail = "DEFERRED_NOT_CHECKED", "NONE", result.get("error", "Проверка отложена пользователем.")
+                        status, method, detail = "DEFERRED_NOT_CHECKED", "NONE", "Проверка отложена пользователем."
                     elif result.get("id"):
                         username = result.get("username") or ""
                         status, method = ("FOUND" if username else "FOUND_NO_USERNAME"), "MIGRATED"
@@ -359,9 +362,9 @@ class QueueStore:
                     elif result.get("retry") or phone in deferred:
                         method = "DIRECT_LOOKUP"
                     elif str(result.get("error", "")).startswith("No response"):
-                        status, method, detail = "UNRESOLVABLE_OR_PRIVACY", "MIGRATED", result["error"]
+                        status, method, detail = "UNRESOLVABLE_OR_PRIVACY", "MIGRATED", "Telegram не раскрыл номер; результат может зависеть от настроек приватности."
                     elif result.get("error"):
-                        status, method, detail = "RETRYABLE_ERROR", "IMPORT", result["error"]
+                        status, method, detail = "RETRYABLE_ERROR", "IMPORT", "Сохранена ошибка старого запроса Telegram; требуется повторная проверка."
                     completed_at = timestamp if status in TERMINAL_STATUSES else None
                     connection.execute(
                         """INSERT INTO job_items(job_id, ordinal, company_name, company_link, raw_phone,
@@ -740,25 +743,49 @@ class QueueStore:
             )
         self._event(connection, claim["job_id"], "RESULT", "Результат сохранён.")
 
-    def finish_batch(self, claims: list[dict], results: dict[str, dict]) -> None:
-        """Save one import response for all claims and release the account once."""
+    def finish_import_batch(self, claims: list[dict], results: dict[str, dict]) -> None:
+        """Persist one dispatched import response, including all scheduling effects."""
+        self.finish_batch(claims, results, import_response=True)
+
+    def finish_batch(
+        self, claims: list[dict], results: dict[str, dict], *, import_response: bool = False,
+    ) -> None:
+        """Commit outcomes and actual import accounting together; cached results do not count."""
         if not claims:
             return
         timestamp = self.now()
-        owner = claims[0]["owner"]
-        account_key = claims[0]["account_key"]
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            for claim in claims:
-                result = results.get(claim["phone"])
+            connection.execute('BEGIN IMMEDIATE')
+            valid_claims = [claim for claim in claims if connection.execute(
+                "SELECT 1 FROM job_items WHERE id = ? AND status = 'IN_PROGRESS' AND lease_owner = ?",
+                (claim['id'], claim['owner']),
+            ).fetchone()]
+            retry_claims = []
+            missing_result = False
+            for claim in valid_claims:
+                result = results.get(claim['phone'])
                 if result is None:
-                    self._retry_claim_connection(connection, claim, RuntimeError("Telegram did not return this phone."), timestamp)
+                    missing_result = True
+                    self._retry_claim_connection(connection, claim, RuntimeError('Missing import result'), timestamp)
+                elif import_response and result.get('retry'):
+                    retry_claims.append(claim)
                 else:
                     self._finish_claim_connection(connection, claim, result, timestamp)
-            connection.execute(
-                "UPDATE worker_state SET lease_owner = NULL, lease_expires_at = NULL WHERE account_key = ? AND lease_owner = ?",
-                (account_key, owner),
-            )
+            if import_response and valid_claims:
+                if retry_claims:
+                    self.defer_import_retries(retry_claims, 'retry_contacts', connection=connection)
+                    connection.execute(
+                        """UPDATE jobs SET import_batch_size = CASE import_batch_size WHEN 10 THEN 5 ELSE 1 END,
+                           updated_at = ? WHERE id = ?""",
+                        (timestamp, claims[0]['job_id']),
+                    )
+                elif not missing_result:
+                    self.record_import_batch_success(claims[0]['job_id'], connection=connection)
+                connection.execute(
+                    "UPDATE worker_state SET import_batches_since_cleanup = import_batches_since_cleanup + 1 WHERE account_key = ?",
+                    (claims[0]['account_key'],),
+                )
+            self._release_account(connection, claims[0])
             connection.commit()
 
     def defer_account_floodwait(self, claims: list[dict], seconds: int) -> None:
@@ -788,8 +815,10 @@ class QueueStore:
                     (resume_after, claim["id"], owner),
                 )
                 connection.execute(
-                    """UPDATE jobs SET state = 'WAITING_RATE_LIMIT', phase = 'WAITING_RATE_LIMIT',
-                       message = 'Telegram ограничил запросы; ожидание сохранено.', import_success_streak = 0, resume_after = ?,
+                    """UPDATE jobs SET state = CASE WHEN state IN ('PAUSED', 'WAITING_AUTHORIZATION') THEN state ELSE 'WAITING_RATE_LIMIT' END,
+                       phase = CASE WHEN state IN ('PAUSED', 'WAITING_AUTHORIZATION') THEN phase ELSE 'WAITING_RATE_LIMIT' END,
+                       message = CASE WHEN state IN ('PAUSED', 'WAITING_AUTHORIZATION') THEN message ELSE 'Telegram ограничил запросы; ожидание сохранено.' END,
+                       import_success_streak = 0, resume_after = ?,
                        run_lease_owner = NULL, run_lease_expires_at = NULL, updated_at = ?
                        WHERE id = ? AND state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED')""",
                     (resume_after, timestamp, claim["job_id"]),
@@ -819,8 +848,10 @@ class QueueStore:
                 [(resume_after, cleanup_id, claim["owner"]) for cleanup_id in claim["cleanup_ids"]],
             )
             connection.execute(
-                """UPDATE jobs SET state = 'WAITING_RATE_LIMIT', phase = 'WAITING_RATE_LIMIT',
-                   resume_after = ?, import_success_streak = 0, message = 'Telegram ограничил очистку контактов; ожидание сохранено.',
+                """UPDATE jobs SET state = CASE WHEN state IN ('PAUSED', 'WAITING_AUTHORIZATION') THEN state ELSE 'WAITING_RATE_LIMIT' END,
+                   phase = CASE WHEN state IN ('PAUSED', 'WAITING_AUTHORIZATION') THEN phase ELSE 'WAITING_RATE_LIMIT' END,
+                   resume_after = ?, import_success_streak = 0,
+                   message = CASE WHEN state IN ('PAUSED', 'WAITING_AUTHORIZATION') THEN message ELSE 'Telegram ограничил очистку контактов; ожидание сохранено.' END,
                    updated_at = ? WHERE id = ? AND state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED')""",
                 (resume_after, timestamp, claim["job_id"]),
             )

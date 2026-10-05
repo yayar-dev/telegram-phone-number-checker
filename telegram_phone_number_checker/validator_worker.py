@@ -17,7 +17,6 @@ from telegram_phone_number_checker.user_session import (
 
 
 MAX_IMPORT_BATCH_SIZE = 10
-_NEXT_IMPORT_BATCH_SIZE = {10: 5, 5: 1, 1: 1}
 
 
 class TelegramGateway(Protocol):
@@ -91,23 +90,12 @@ class ValidatorWorker:
             phone: results.get(phone, {"error": "Telegram returned no result for this phone."})
             for phone in unique_phones
         }
-        retry_claims = [
-            claim for claim in pending if normalized_results[claim["phone"]].get("retry")
-        ]
-        completed_claims = [claim for claim in pending if claim not in retry_claims]
-        if completed_claims:
-            completed_results = self._results_for(completed_claims, normalized_results)
-            self._finish(completed_claims, completed_results)
-            self._remember(completed_claims, completed_results)
-        if retry_claims:
-            self.store.defer_import_retries(retry_claims, 'retry_contacts')
-            self._reduce_import_batch_size(retry_claims[0])
-        else:
-            self.store.record_import_batch_success(pending[0]['job_id'])
+        # The store owns one transaction for terminal results, retry rows,
+        # adaptive size/streak, and the durable cleanup budget.
+        self.store.finish_import_batch(pending, normalized_results)
+        completed_claims = [claim for claim in pending if not normalized_results[claim['phone']].get('retry')]
+        self._remember(completed_claims, normalized_results)
         self._import_batches_since_cleanup += 1
-        completed = getattr(self.store, 'record_import_batch_completed', None)
-        if completed:
-            completed(pending[0]['account_key'])
         return True
 
     def _run_direct_lookup(self, claims: list[dict]) -> bool:
@@ -176,13 +164,6 @@ class ValidatorWorker:
         else:
             for claim in claims:
                 self.store.retry_claim(claim, error)
-
-    def _reduce_import_batch_size(self, claim: dict) -> None:
-        current = claim.get("import_batch_size", MAX_IMPORT_BATCH_SIZE)
-        next_size = _NEXT_IMPORT_BATCH_SIZE.get(current, 1)
-        setter = getattr(self.store, "set_import_batch_size", None)
-        if setter:
-            setter(claim["job_id"], next_size)
 
     def _run_cleanup_once(self) -> bool:
         claim_cleanup = getattr(self.store, "claim_cleanup_batch", None)

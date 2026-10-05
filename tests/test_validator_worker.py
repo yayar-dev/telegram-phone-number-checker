@@ -73,6 +73,13 @@ class BatchStore:
     def finish_batch(self, claims, results):
         self.finished.extend((claim["id"], results[claim["phone"]]) for claim in claims)
 
+    def finish_import_batch(self, claims, results):
+        retry_claims = [claim for claim in claims if results[claim['phone']].get('retry')]
+        self.finish_batch([claim for claim in claims if claim not in retry_claims], results)
+        if retry_claims:
+            self.defer_import_retries(retry_claims, 'retry_contacts')
+            self.set_import_batch_size(claims[0]['job_id'], 5)
+
     def defer_import_retries(self, claims, reason):
         self.direct.extend(claim["id"] for claim in claims)
 
@@ -454,3 +461,129 @@ def test_browser_login_requires_explicit_resume_after_revocation(tmp_path):
         server_thread.join(timeout=2)
         server.server_close()
         app.close()
+
+
+def test_completed_import_and_cleanup_budget_commit_before_crash(tmp_path):
+    import pytest
+
+    class CrashAfterFifthCommit(QueueStore):
+        def finish_batch(self, claims, results, **kwargs):
+            super().finish_batch(claims, results, **kwargs)
+            if self.snapshot(claims[0]['job_id'])['processed'] == 5:
+                raise SystemExit('simulated crash after durable outcome commit')
+
+    store = CrashAfterFifthCommit(tmp_path / 'validator.db')
+    job_id = store.create_job('\n'.join(f'+79990000{i:03d}' for i in range(12)))
+    store.start(job_id)
+    store.set_import_batch_size(job_id, 1)
+
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+        def import_phones(self, phones):
+            self.calls.append('IMPORT')
+            return {phone: {'id': 123} for phone in phones}
+        def cleanup_contacts(self, user_ids):
+            self.calls.append('CLEANUP')
+
+    gateway = Gateway()
+    worker = ValidatorWorker(store, gateway, 'worker')
+    for _ in range(4):
+        assert worker.run_once()
+    with pytest.raises(SystemExit):
+        worker.run_once()
+    reopened = QueueStore(store.path)
+    assert reopened.snapshot(job_id)['processed'] == 5
+    assert reopened.snapshot(job_id)['import_batch_size'] == 5
+    assert reopened.snapshot(job_id)['import_success_streak'] == 0
+    assert reopened.cleanup_due() is True
+    assert ValidatorWorker(reopened, gateway, 'worker').run_once()
+    assert gateway.calls == ['IMPORT'] * 5 + ['CLEANUP']
+
+
+def test_import_accounting_failure_rolls_back_outcomes_and_evidence(tmp_path):
+    import sqlite3
+    import pytest
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = store.create_job('+79991234567')
+    store.start(job_id)
+    with store._connect() as connection:
+        connection.execute("""CREATE TRIGGER fail_import_accounting BEFORE UPDATE OF import_success_streak ON jobs
+            WHEN NEW.import_success_streak > OLD.import_success_streak
+            BEGIN SELECT RAISE(ABORT, 'simulated accounting write failure'); END""")
+    class Gateway:
+        def import_phones(self, phones):
+            return {phones[0]: {'id': 123}}
+    with pytest.raises(sqlite3.IntegrityError):
+        ValidatorWorker(store, Gateway(), 'worker').run_once()
+    assert store.rows(job_id)[0]['status'] == 'IN_PROGRESS'
+    assert store.snapshot(job_id)['processed'] == 0
+    with store._connect() as connection:
+        assert connection.execute('SELECT COUNT(*) FROM job_item_attempts').fetchone()[0] == 0
+        assert connection.execute('SELECT COUNT(*) FROM contact_cleanup').fetchone()[0] == 0
+        assert connection.execute('SELECT import_batches_since_cleanup FROM worker_state').fetchone()[0] == 0
+
+
+def test_partial_import_retry_and_budget_share_outcome_commit(tmp_path):
+    import pytest
+    class CrashAfterOutcomeCommit(QueueStore):
+        def finish_batch(self, claims, results, **kwargs):
+            super().finish_batch(claims, results, **kwargs)
+            raise SystemExit('simulated crash after partial response commit')
+    clock = Clock()
+    store = CrashAfterOutcomeCommit(tmp_path / 'validator.db', now=clock)
+    job_id = store.create_job('+79991234567\n+79991234568')
+    store.start(job_id)
+    class Gateway:
+        def import_phones(self, phones):
+            return {phones[0]: {'id': 123}, phones[1]: {'retry': True}}
+    with pytest.raises(SystemExit):
+        ValidatorWorker(store, Gateway(), 'worker').run_once()
+    reopened = QueueStore(store.path, now=clock)
+    assert [row['status'] for row in reopened.rows(job_id)] == ['FOUND_NO_USERNAME', 'PENDING_RETRY']
+    assert reopened.rows(job_id)[1]['next_attempt_at'] == 1060
+    assert reopened.snapshot(job_id)['import_batch_size'] == 5
+    assert reopened.snapshot(job_id)['import_success_streak'] == 0
+    with reopened._connect() as connection:
+        assert connection.execute('SELECT import_batches_since_cleanup FROM worker_state').fetchone()[0] == 1
+
+
+def test_inflight_import_and_cleanup_floodwait_cannot_undo_operator_pause(tmp_path):
+    import threading
+    for operation in ('IMPORT', 'CLEANUP'):
+        clock = Clock()
+        store = QueueStore(tmp_path / f'{operation}.db', now=clock)
+        job_id = store.create_job('+79991234567')
+        store.start(job_id)
+        if operation == 'CLEANUP':
+            store.finish_claim(store.claim_next('worker'), {'id': 123})
+        started, release = threading.Event(), threading.Event()
+        class Gateway:
+            calls = 0
+            def request(self):
+                self.calls += 1
+                started.set()
+                assert release.wait(2)
+                raise FloodWaitError(None, 230)
+            def import_phones(self, phones):
+                self.request()
+            def cleanup_contacts(self, user_ids):
+                self.request()
+        gateway = Gateway()
+        worker = ValidatorWorker(store, gateway, 'worker')
+        outcomes = []
+        thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()), daemon=True)
+        thread.start()
+        try:
+            assert started.wait(2)
+            assert store.pause(job_id)
+        finally:
+            release.set()
+            thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert outcomes == [True]
+        assert store.snapshot(job_id)['state'] == 'PAUSED'
+        clock.value = 1300
+        assert worker.run_once() is False
+        assert store.snapshot(job_id)['state'] == 'PAUSED'
+        assert gateway.calls == 1
