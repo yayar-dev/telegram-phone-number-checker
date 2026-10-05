@@ -799,14 +799,14 @@ class QueueStore:
         if status == "NOT_FOUND_OR_PRIVACY_RESTRICTED":
             status = "UNRESOLVABLE_OR_PRIVACY"
         values = (
-            status, claim["method"], mapped["detail"], mapped["telegram_id"], mapped["username"],
+            status, status, claim["method"], mapped["detail"], mapped["telegram_id"], mapped["username"],
             mapped["name"], mapped["telegram_link"], timestamp,
         )
         evidence_rows = self._claim_and_duplicates(connection, claim)
         for row in evidence_rows:
             self.record_item_attempt(row['id'], claim['method'], status, mapped['detail'], connection=connection)
         changed = connection.execute(
-            """UPDATE job_items SET status = ?, method = ?, detail = ?, telegram_id = ?, username = ?,
+            """UPDATE job_items SET status = ?, api_status = ?, method = ?, detail = ?, telegram_id = ?, username = ?,
                name = ?, telegram_link = ?, lease_owner = NULL, lease_expires_at = NULL, completed_at = ?
                WHERE id = ? AND status = 'IN_PROGRESS' AND lease_owner = ?""",
             (*values, claim["id"], claim["owner"]),
@@ -814,7 +814,7 @@ class QueueStore:
         if not changed:
             return
         connection.execute(
-            """UPDATE job_items SET status = ?, method = ?, detail = ?, telegram_id = ?, username = ?,
+            """UPDATE job_items SET status = ?, api_status = ?, method = ?, detail = ?, telegram_id = ?, username = ?,
                name = ?, telegram_link = ?, completed_at = ?
                WHERE job_id = ? AND normalized_phone = ? AND id != ?
                AND status IN ('PENDING', 'RETRYABLE_ERROR', 'PENDING_RETRY')""",

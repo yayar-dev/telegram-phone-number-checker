@@ -621,3 +621,60 @@ def test_review_requeue_rolls_back_rows_and_evidence_on_audit_failure(tmp_path, 
     assert store.events(job_id) == events
     with store._connect() as connection:
         assert connection.execute('SELECT COUNT(*) FROM job_item_attempts').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('review_action', ['requeue_legacy_direct_rows', 'requeue_unknown_outcomes'])
+def test_requeued_item_latest_import_outcome_replaces_api_status_and_preserves_history(tmp_path, review_action):
+    clock = Clock()
+    store = QueueStore(tmp_path / 'validator.db', now=clock)
+    job_id = store.create_job('+79990000000\n+79990000000')
+    store.start(job_id)
+    store.pause(job_id)
+    unknown = review_action == 'requeue_unknown_outcomes'
+    old_status = 'UNKNOWN_OUTCOME_REVIEW' if unknown else 'UNRESOLVABLE_OR_PRIVACY'
+    old_outcome = 'UNKNOWN_OUTCOME' if unknown else 'UNRESOLVABLE_OR_PRIVACY'
+    old_method = 'IMPORT' if unknown else 'DIRECT_LOOKUP'
+    with store._connect() as connection:
+        connection.execute('UPDATE job_items SET status=?, api_status=?, method=? WHERE job_id=?',
+                           (old_status, old_outcome, old_method, job_id))
+    for row in store.rows(job_id):
+        store.record_item_attempt(int(row['_item_id']), old_method, old_outcome, 'Prior immutable evidence')
+    assert getattr(store, review_action)(job_id) == 2
+    history_before_response = {row['_item_id']: store.item_attempts(job_id, row['_item_id']) for row in store.rows(job_id)}
+    assert [row['api_status'] for row in store.rows(job_id)] == [old_outcome] * 2
+
+    assert store.start(job_id) is True
+    assert store.claim_batch('worker', 10) == []
+    clock.value += 60
+    claims = store.claim_batch('worker', 10)
+    assert len(claims) == 1
+    store.finish_import_batch(claims, {'+79990000000': {'id': 123, 'username': 'confirmed'}})
+
+    for row in QueueStore(store.path, now=clock).rows(job_id):
+        assert row['status'] == 'FOUND'
+        assert row['api_status'] == 'FOUND'
+        history = store.item_attempts(job_id, row['_item_id'])
+        assert history[:-1] == history_before_response[row['_item_id']]
+        assert history[0]['outcome'] == old_outcome
+        assert history[-1]['outcome'] == 'FOUND'
+        assert history[-1]['method'] == 'IMPORT'
+
+
+@pytest.mark.parametrize('result, outcome', [
+    ({'id': 123, 'username': 'confirmed'}, 'FOUND'),
+    ({'id': 123}, 'FOUND_NO_USERNAME'),
+    ({'error': 'No response'}, 'UNRESOLVABLE_OR_PRIVACY'),
+])
+def test_direct_terminal_response_updates_current_api_status_for_claim_and_duplicates(tmp_path, result, outcome):
+    store = QueueStore(tmp_path / 'validator.db', now=Clock())
+    job_id = store.create_job('+79990000000\n+79990000000')
+    with store._connect() as connection:
+        connection.execute("UPDATE job_items SET method='DIRECT_LOOKUP', api_status='UNKNOWN_OUTCOME' WHERE job_id=?", (job_id,))
+    store.start(job_id)
+    claim = store.claim_next('worker')
+    store.finish_claim(claim, result)
+    rows = store.rows(job_id)
+    assert [row['status'] for row in rows] == [outcome] * 2
+    assert [row['api_status'] for row in rows] == [outcome] * 2
+    for row in rows:
+        assert store.item_attempts(job_id, row['_item_id'])[-1]['outcome'] == outcome
