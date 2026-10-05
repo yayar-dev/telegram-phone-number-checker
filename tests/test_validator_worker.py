@@ -3,6 +3,98 @@ from telegram_phone_number_checker.validator_worker import ValidatorWorker
 from telethon.errors import FloodWaitError
 
 
+def test_application_restart_during_import_preserves_unknown_row_without_double_finish(tmp_path, monkeypatch):
+    """A cancelled dispatched request stays quarantined across a new application."""
+    import asyncio
+    from threading import Event
+    import time
+    from types import SimpleNamespace
+    from telegram_phone_number_checker.durable_web import DurableValidatorApplication
+    from telegram_phone_number_checker.user_session import UserSessionService
+
+    monkeypatch.setenv('API_ID', '1')
+    monkeypatch.setenv('API_HASH', 'hash')
+    monkeypatch.setenv('TELEGRAM_SESSION_PATH', str(tmp_path / 'telegram-session'))
+
+    class Client:
+        def __init__(self, block):
+            self.block = block
+            self.connected = False
+            self.started = Event()
+            self.requests = []
+        async def connect(self):
+            self.connected = True
+        def is_connected(self):
+            return self.connected
+        async def is_user_authorized(self):
+            return True
+        async def disconnect(self):
+            self.connected = False
+        async def __call__(self, request):
+            self.requests.append(request)
+            self.started.set()
+            if self.block:
+                await asyncio.Event().wait()
+            return SimpleNamespace(imported=[], users=[], retry_contacts=[])
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(.01)
+        raise AssertionError('application did not reach expected durable state')
+
+    database = tmp_path / 'validator.db'
+    first_client = Client(block=True)
+    first_session = UserSessionService(client_factory=lambda *args, **kwargs: first_client)
+    first = DurableValidatorApplication(database, gateway=first_session, authorization=first_session)
+    try:
+        job_id = first.enqueue('+79990000001\n+79990000002')
+        first.store.set_import_batch_size(job_id, 1)
+        assert first.begin_authorization('+79991112233')
+        wait_for(lambda: first_session.snapshot()['state'] == 'AUTHORIZED')
+        assert first.start(job_id)
+        assert first_client.started.wait(3)
+        with first.store._connect() as connection:
+            old_claim = dict(connection.execute("SELECT * FROM job_items WHERE status='IN_PROGRESS'").fetchone())
+        assert old_claim['lease_owner'] == first.owner
+        assert old_claim['lease_expires_at'] > time.time()
+        # The normal application close path still runs; shorten only the owned
+        # session's request drain so this deterministic blocked fake is cancelled.
+        first_session.close(timeout=.01)
+    finally:
+        first.close()
+    assert not first._worker_thread.is_alive()
+    assert not first_client.connected
+    assert first.store.rows(job_id)[0]['status'] == 'UNKNOWN_OUTCOME_REVIEW'
+    assert len(first.store.item_attempts(job_id, str(old_claim['id']))) == 1
+
+    next_client = Client(block=False)
+    next_session = UserSessionService(client_factory=lambda *args, **kwargs: next_client)
+    restarted = DurableValidatorApplication(database, gateway=next_session, authorization=next_session)
+    try:
+        wait_for(lambda: restarted.store.rows(job_id)[1]['status'] == 'UNRESOLVABLE_OR_PRIVACY')
+        rows = restarted.store.rows(job_id)
+        assert len(rows) == 2
+        assert rows[0]['status'] == 'UNKNOWN_OUTCOME_REVIEW'
+        assert rows[1]['status'] == 'UNRESOLVABLE_OR_PRIVACY'
+        assert len(next_client.requests) == 1
+        assert next_client.requests[0].contacts[0].phone == '+79990000002'
+        # A response arriving from the former owner cannot overwrite quarantine.
+        stale = {**old_claim, 'phone': old_claim['normalized_phone'], 'owner': first.owner, 'account_key': 'default'}
+        restarted.store.finish_claim(stale, {'id': 123, 'username': 'late_response'})
+        assert restarted.store.rows(job_id) == rows
+        assert len(restarted.store.item_attempts(job_id, rows[0]['_item_id'])) == 1
+        assert len(restarted.store.item_attempts(job_id, rows[1]['_item_id'])) == 1
+        with restarted.store._connect() as connection:
+            assert connection.execute("SELECT COUNT(*) FROM job_items WHERE lease_owner IS NOT NULL").fetchone()[0] == 0
+            assert connection.execute("SELECT COUNT(*) FROM worker_state WHERE lease_owner IS NOT NULL").fetchone()[0] == 0
+        assert restarted.snapshot(job_id)['state'] != 'COMPLETED'
+    finally:
+        restarted.close()
+
+
 class Gateway:
     def __init__(self):
         self.imports = []

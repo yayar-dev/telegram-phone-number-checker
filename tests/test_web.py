@@ -4,6 +4,12 @@ from threading import Thread
 import time
 from urllib.parse import urlencode
 import asyncio
+import os
+import re
+import signal
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -14,6 +20,159 @@ from telegram_phone_number_checker.durable_web import (
 )
 from telegram_phone_number_checker.queue_store import QueueStore
 from telegram_phone_number_checker.user_session import UserSessionService
+
+
+def _wait_for_lifecycle(predicate, timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(.01)
+    raise AssertionError('lifecycle did not reach expected state')
+
+
+@pytest.mark.parametrize('password_error', [False, True])
+def test_browser_lifecycle_secrets_never_reach_database_csv_html_or_logs(tmp_path, monkeypatch, capfd, caplog, password_error):
+    """Exercises real HTTP -> session handoff, including an error echoing secrets."""
+    otp, password = '847296135', 'task5-2fa-S3cret-20261005'
+    monkeypatch.setenv('API_ID', '1')
+    monkeypatch.setenv('API_HASH', 'hash')
+    monkeypatch.setenv('TELEGRAM_SESSION_PATH', str(tmp_path / 'telegram-session'))
+
+    class SecretClient(_TwoFactorAuthorizationClient):
+        async def sign_in(self, phone=None, code=None, password=None):
+            if password is not None and password_error:
+                raise ValueError(f'echoed credentials {otp} {password}')
+            await super().sign_in(phone, code, password)
+
+    service = UserSessionService(client_factory=lambda *args, **kwargs: SecretClient())
+    app = DurableValidatorApplication(tmp_path / 'validator.db', gateway=service, authorization=service)
+    job_id = app.enqueue('+79990000001')
+    server = create_durable_server(app, port=0)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+    outputs = []
+    try:
+        for path, values, state in [
+            ('/auth/begin', {'phone_number': '+79991112233'}, 'CODE_SENT'),
+            ('/auth/code', {'code': otp}, 'PASSWORD_REQUIRED'),
+            ('/auth/password', {'password': password}, 'ERROR' if password_error else 'AUTHORIZED'),
+        ]:
+            connection.request('POST', path, urlencode(values), {'Content-Type': 'application/x-www-form-urlencoded'})
+            response = connection.getresponse()
+            outputs.append(response.read().decode())
+            assert response.status == 303
+            _wait_for_lifecycle(lambda: service.snapshot()['state'] == state)
+            for page_path in ['/', f'/jobs/{job_id}', f'/download.csv?job={job_id}']:
+                connection.request('GET', page_path)
+                response = connection.getresponse()
+                assert response.status == 200
+                outputs.append(response.read().decode())
+        assert app.store.snapshot(job_id)['state'] == 'STAGED'
+        with app.store._connect() as database:
+            # Enumerates every current/future SQLite table, including events,
+            # migration metadata, attempts, account and cleanup records.
+            outputs.append('\n'.join(database.iterdump()))
+    finally:
+        connection.close()
+        server.shutdown()
+        thread.join(timeout=3)
+        server.server_close()
+        app.close()
+    captured = capfd.readouterr()
+    outputs.extend([captured.out, captured.err, caplog.text])
+    for output in outputs:
+        assert otp not in output
+        assert password not in output
+    assert otp.encode() not in (tmp_path / 'validator.db').read_bytes()
+    assert password.encode() not in (tmp_path / 'validator.db').read_bytes()
+
+
+def test_sigterm_lifecycle_exits_within_docker_grace_and_releases_active_import(tmp_path):
+    """Runs the actual main/server/session/worker in a process receiving SIGTERM."""
+    # Use the deployment's configured deadline rather than assuming a host
+    # default (some Compose installations create a one-second StopTimeout).
+    compose = (Path(__file__).resolve().parents[1] / 'compose.yaml').read_text()
+    grace = re.search(r'^\s+stop_grace_period:\s*(\d+)s\s*$', compose, re.MULTILINE)
+    assert grace is not None, 'Configure the Docker shutdown deadline explicitly'
+    grace_seconds = int(grace.group(1))
+    script = textwrap.dedent('''
+        import asyncio
+        import os
+        from pathlib import Path
+        import time
+        from telegram_phone_number_checker import durable_web, main as upstream, web
+
+        root = Path(os.environ['TELEGRAM_VALIDATOR_DATA_DIR'])
+        class Client:
+            connected = False
+            async def connect(self): self.connected = True
+            def is_connected(self): return self.connected
+            async def is_user_authorized(self): return True
+            async def disconnect(self): self.connected = False
+            async def __call__(self, request):
+                (root / 'dispatched').write_text('IMPORT dispatched')
+                await asyncio.Event().wait()
+        upstream.TelegramClient = lambda *args, **kwargs: Client()
+        application_type = durable_web.DurableValidatorApplication
+        def make_application(*args, **kwargs):
+            app = application_type(*args, **kwargs)
+            app.begin_authorization('+79991112233')
+            deadline = time.monotonic() + 3
+            while app.authorization.snapshot()['state'] != 'AUTHORIZED':
+                if time.monotonic() > deadline: raise RuntimeError('authorization timed out')
+                time.sleep(.01)
+            job = app.enqueue('+79990000001')
+            (root / 'job-id').write_text(job)
+            assert app.start(job)
+            return app
+        durable_web.DurableValidatorApplication = make_application
+        server_factory = durable_web.create_server
+        def make_server(*args, **kwargs):
+            kwargs['port'] = 0
+            server = server_factory(*args, **kwargs)
+            (root / 'port').write_text(str(server.server_port))
+            return server
+        durable_web.create_server = make_server
+        web.main()
+    ''')
+    environment = {
+        **os.environ, 'API_ID': '1', 'API_HASH': 'test-hash',
+        'TELEGRAM_VALIDATOR_DATA_DIR': str(tmp_path), 'TELEGRAM_SESSION_PATH': str(tmp_path / 'telegram-session'),
+        'TELEGRAM_VALIDATOR_PORT': '8010', 'TELEGRAM_VALIDATOR_HOST': '127.0.0.1',
+    }
+    process = subprocess.Popen([sys.executable, '-u', '-c', script], cwd=Path(__file__).resolve().parents[1],
+                               env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _wait_for_lifecycle(lambda: (tmp_path / 'dispatched').exists() and (tmp_path / 'port').exists(), timeout=5)
+        connection = HTTPConnection('127.0.0.1', int((tmp_path / 'port').read_text()), timeout=2)
+        connection.request('GET', '/')
+        response = connection.getresponse()
+        assert response.status == 200
+        assert 'Telegram подключён.' in response.read().decode()
+        connection.close()
+        store = QueueStore(tmp_path / '.validator.db')
+        job_id = (tmp_path / 'job-id').read_text()
+        assert store.rows(job_id)[0]['status'] == 'IN_PROGRESS'
+        started = time.monotonic()
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=grace_seconds)
+        assert time.monotonic() - started < grace_seconds
+        assert process.returncode == 0, (stdout, stderr)
+        assert 'Traceback' not in stderr
+        restarted = QueueStore(tmp_path / '.validator.db')
+        rows = restarted.rows(job_id)
+        assert len(rows) == 1
+        assert rows[0]['status'] == 'UNKNOWN_OUTCOME_REVIEW'
+        assert [entry['outcome'] for entry in restarted.item_attempts(job_id, rows[0]['_item_id'])] == ['UNKNOWN_OUTCOME']
+        with restarted._connect() as connection:
+            assert connection.execute("SELECT COUNT(*) FROM job_items WHERE lease_owner IS NOT NULL OR status='IN_PROGRESS'").fetchone()[0] == 0
+            assert connection.execute("SELECT COUNT(*) FROM worker_state WHERE lease_owner IS NOT NULL").fetchone()[0] == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=3)
 
 
 class _BlockingGateway:

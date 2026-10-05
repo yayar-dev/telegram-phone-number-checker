@@ -1,5 +1,6 @@
 """Persistent owner tests at the Telethon boundary, without network or prompts."""
 import asyncio
+import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, get_ident
 import time
@@ -445,3 +446,66 @@ def test_close_during_error_disposal_waits_until_client_disconnects(services, cl
     assert not client.is_connected()
     assert client.disconnect_calls == 1
     assert not service._thread.is_alive()
+
+
+def test_paused_legacy_job_lifecycle_migrates_authorizes_and_resumes_without_new_client(tmp_path):
+    """Catches auto-resume, new-client handoff, and overwriting review/manual evidence."""
+    from telegram_phone_number_checker.durable_web import DurableValidatorApplication
+
+    phones = ['+79990000001', '+79990000002', '+79990000003']
+    source = tmp_path / 'legacy.json'
+    source.write_text(json.dumps({'jobs': {'legacy': {
+        'raw': '\n'.join(phones),
+        'results_by_phone': {phones[0]: {'retry': True}, phones[1]: {'error': 'No response'}},
+    }}}))
+    source_bytes = source.read_bytes()
+    client = Client(authorized=False)
+    factory = Factory(client)
+    service = UserSessionService(client_factory=factory)
+    app = DurableValidatorApplication(tmp_path / 'validator.db', source, gateway=service, authorization=service)
+    clock = [time.time()]
+    app.store.now = lambda: clock[0]
+    try:
+        assert app.snapshot('legacy')['state'] == 'STAGED'
+        assert not app.start('legacy')
+        # Model persisted upgraded rows: a manually reviewed direct privacy row
+        # and a previous dispatched request whose outcome is quarantined.
+        with app.store._connect() as connection:
+            connection.execute("UPDATE jobs SET state='PAUSED' WHERE id='legacy'")
+            connection.execute("UPDATE job_items SET method='DIRECT_LOOKUP' WHERE job_id='legacy' AND ordinal=1")
+            connection.execute("UPDATE job_items SET status='UNKNOWN_OUTCOME_REVIEW', api_status='UNKNOWN_OUTCOME' WHERE job_id='legacy' AND ordinal=2")
+        manual_id = app.store.rows('legacy')[1]['_item_id']
+        assert app.confirm_manual_chat('legacy', manual_id)
+        before = app.store.rows('legacy')
+        assert app.store.requeue_legacy_direct_rows('legacy') == 1
+        assert app.snapshot('legacy')['state'] == 'PAUSED'
+        # A queued task discovering revoked/absent credentials must wait durably.
+        clock[0] += 61
+        assert app.store.start('legacy')
+        assert wait_until(lambda: app.snapshot('legacy')['state'] == 'WAITING_AUTHORIZATION')
+        assert client.requests == []
+        assert app.begin_authorization('+79991112233')
+        assert wait_until(lambda: service.snapshot()['state'] == 'CODE_SENT')
+        assert app.submit_authorization_code('12345')
+        assert wait_until(lambda: service.snapshot()['state'] == 'AUTHORIZED')
+        assert app.snapshot('legacy')['state'] == 'WAITING_AUTHORIZATION'
+        assert client.requests == []
+        assert app.start('legacy')
+        assert wait_until(lambda: app.store.rows('legacy')[0]['status'] == 'UNRESOLVABLE_OR_PRIVACY')
+        after = app.store.rows('legacy')
+        assert after[1:] == before[1:]
+        assert after[0]['method'] == 'IMPORT'
+        assert [attempt['source'] for attempt in app.store.item_attempts('legacy', after[0]['_item_id'])] == [
+            'JSON_MIGRATION', 'LEGACY_DIRECT_MIGRATION', 'TELEGRAM',
+        ]
+        assert source.read_bytes() == source_bytes
+        assert factory.created == 1
+        assert len(client.requests) == 1
+        assert isinstance(client.requests[0], ImportContactsRequest)
+        assert len(client.requests[0].contacts) == 1
+        assert client.requests[0].contacts[0].phone == phones[0]
+        assert 'Неизвестный результат — требуется решение оператора: 1' in app.render_job_page('legacy')
+    finally:
+        app.close()
+    assert client.disconnect_calls == 1
+    assert not app._worker_thread.is_alive()
