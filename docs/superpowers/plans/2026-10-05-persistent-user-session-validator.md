@@ -72,6 +72,14 @@ def test_authorization_handoff_keeps_same_client_for_first_import():
     assert fake_factory.created == 1
 
 
+def test_pre_dispatch_failure_recreates_authorized_client_for_later_retry():
+    with pytest.raises(RequestNotDispatchedError):
+        service.import_phones(["+79990000001"])
+    service.import_phones(["+79990000001"])  # later durable retry
+    assert fake_factory.created == 2
+    assert fake_factory.clients[1].authorized is True
+
+
 def test_revoked_session_raises_user_session_unavailable_without_upstream_login(monkeypatch):
     with pytest.raises(UserSessionUnavailableError):
         service.import_phones(["+79990000001"])
@@ -90,11 +98,11 @@ Expected: FAIL because `UserSessionService` does not exist.
 
 Run one asyncio loop in one background thread. The service owns the only Telethon client for both phone/OTP/2FA and validation. Browser authorization uses `send_code_request`, `sign_in`, and optional password on that same loop; it exposes `AUTHORIZED` only after the client remains connected and `is_user_authorized()` succeeds. Validation operations submit coroutines serially to that loop and never call `upstream.login` or `input()`.
 
-On a connect failure before any request dispatch, raise `RequestNotDispatchedError`; on a disconnect/error after the coroutine is dispatched, raise `RequestOutcomeUnknownError`. Do not replay the operation in the service. `close()` sets a stop flag, rejects new work, waits up to its timeout for the active operation, disconnects the client, and stops the loop.
+On a connect failure before any request dispatch, invalidate and dispose the broken client, then raise `RequestNotDispatchedError`; the service does not replay the operation. On the next due durable claim, it must create/connect one fresh client and verify `is_user_authorized()` before dispatch. On a disconnect/error after the coroutine is dispatched, raise `RequestOutcomeUnknownError`; do not replay it in the service. `close()` sets a stop flag, rejects new work, waits up to its timeout for the active operation, disconnects the client, and stops the loop.
 
 - [ ] **Step 4: Wire service lifecycle into the application**
 
-Replace `TelegramAuthorization` plus short-lived `TelethonGateway` with a shared `UserSessionService`; retain the existing browser endpoints and dependency injection for tests. Add `DurableValidatorApplication.close()`. In `web.main()`, install a SIGTERM handler that stops `serve_forever()`, then calls application close after the server stops accepting requests.
+Replace `TelegramAuthorization` plus short-lived `TelethonGateway` with a shared `UserSessionService`; retain the existing browser endpoints and dependency injection for tests. Add `DurableValidatorApplication.close()`. In `web.main()`, install a SIGTERM handler that stops `serve_forever()`, then calls application close after the server stops accepting requests. A successful browser authorization leaves jobs in `WAITING_AUTHORIZATION`; it never submits work itself. The later explicit resume path is enabled only for an `AUTHORIZED` service snapshot.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -142,7 +150,7 @@ def test_revoked_session_pauses_job_without_incrementing_normal_retry_count():
     assert store.snapshot(job_id)["state"] == "WAITING_AUTHORIZATION"
 ```
 
-Add tests for a 230-second `FloodWait`, five successful batches restoring 1 → 5 then 5 → 10, cancellation of `PENDING_RETRY`, five ready import batches running before one cleanup batch, and a paused job with pending cleanup issuing no Telegram request.
+Add tests for a 230-second `FloodWait`, five successful batches restoring 1 → 5 then 5 → 10, cancellation of `PENDING_RETRY`, five ready import batches running before one cleanup batch, a paused job with pending cleanup issuing no Telegram request, and revoke → `WAITING_AUTHORIZATION` → browser login → explicit resume → one import request.
 
 - [ ] **Step 2: Run those tests to verify they fail**
 
@@ -235,6 +243,7 @@ git commit -m "feat: migrate legacy direct validation safely"
 
 **Interfaces:**
 - Produces: `QueueStore.result_summary(job_id: str) -> dict[str, int]` with `api_confirmed`, `pending_retry`, `privacy_ambiguous`, `pending_import`, `waiting_authorization`, and `unknown_outcome_review`.
+- Modifies: `QueueStore.start(job_id)` accepts `WAITING_AUTHORIZATION` only when the application has confirmed `UserSessionService.snapshot()["state"] == "AUTHORIZED"`.
 
 - [ ] **Step 1: Write failing summary/UI tests**
 
@@ -250,7 +259,7 @@ def test_result_summary_separates_api_confirmation_from_privacy_and_retry():
     }
 ```
 
-Add page assertions for `Подтверждено API`, `API не определил из-за приватности`, `Повторный импорт ожидают`, and `Требуется повторная авторизация`; assert it never labels a privacy result as absent.
+Add page assertions for `Подтверждено API`, `API не определил из-за приватности`, `Повторный импорт ожидают`, and `Требуется повторная авторизация`; assert it never labels a privacy result as absent. For `WAITING_AUTHORIZATION`, assert the page shows `Возобновить после авторизации`, rejects resume while the service is not authorized, and accepts one explicit resume only after the service is `AUTHORIZED`.
 
 - [ ] **Step 2: Run summary tests to verify they fail**
 
@@ -260,7 +269,7 @@ Expected: FAIL because `result_summary` is missing.
 
 - [ ] **Step 3: Implement summary, copy, and documentation**
 
-Count `FOUND` and `FOUND_NO_USERNAME` as API-confirmed, `PENDING_RETRY` separately, `UNRESOLVABLE_OR_PRIVACY` separately, `UNKNOWN_OUTCOME_REVIEW` separately, and pending `IMPORT` rows separately. Suppress a confident completion ETA whenever retry, unknown-outcome review, FloodWait, or authorization wait exists; show the stored reason and next attempt instead. Document browser authorization, paused-job migration, manual confirmation, privacy ambiguity, unknown-outcome operator requeue, and Docker stop/start.
+Count `FOUND` and `FOUND_NO_USERNAME` as API-confirmed, `PENDING_RETRY` separately, `UNRESOLVABLE_OR_PRIVACY` separately, `UNKNOWN_OUTCOME_REVIEW` separately, and pending `IMPORT` rows separately. Suppress a confident completion ETA whenever retry, unknown-outcome review, FloodWait, or authorization wait exists; show the stored reason and next attempt instead. For `WAITING_AUTHORIZATION`, show `Возобновить после авторизации`; validate the current `AUTHORIZED` session before calling `QueueStore.start()`, and never resume it automatically after login. Document browser authorization, paused-job migration, manual confirmation, privacy ambiguity, unknown-outcome operator requeue, and Docker stop/start.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -324,6 +333,6 @@ git commit -m "test: cover persistent user-session lifecycle"
 ## Self-Review
 
 - Spec coverage: Task 1 owns the one user session and secure handoff; Task 2 owns attempt history, rate-aware scheduling, and unknown outcomes; Task 3 owns migration and explicit unknown-outcome review; Task 4 owns truthful operator output; Task 5 proves restart behavior.
-- CTO blockers: pending legacy direct rows, unknown request outcomes, revoked sessions, durable attempt history, authorization handoff, deterministic shutdown, cleanup starvation, visible retry policy, secrecy, and full acceptance coverage each have an explicit task and test.
+- CTO blockers: pending legacy direct rows, unknown request outcomes, revoked sessions and their explicit resume transition, pre-dispatch client recovery, durable attempt history, authorization handoff, deterministic shutdown, cleanup starvation, visible retry policy, secrecy, and full acceptance coverage each have an explicit task and test.
 - Type consistency: the worker continues to consume the existing synchronous gateway protocol while the session owner encapsulates its asyncio loop.
 - Scope: no multi-account dispatch, bot workflow, or client UI automation is included.
