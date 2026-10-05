@@ -17,7 +17,7 @@ class Gateway:
         return {"id": 1, "username": "resolved"}
 
 
-def test_worker_moves_retry_contact_to_direct_lookup(tmp_path):
+def test_retry_contacts_return_to_import_queue_without_resolve_phone(tmp_path):
     store = QueueStore(tmp_path / "validator.db")
     job_id = store.create_job("+79991234567")
     assert store.start(job_id) is True
@@ -25,12 +25,11 @@ def test_worker_moves_retry_contact_to_direct_lookup(tmp_path):
     worker = ValidatorWorker(store, gateway, "test-worker")
 
     assert worker.run_once() is True
-    assert store.rows(job_id)[0]["status"] == "PENDING"
-    assert worker.run_once() is True
-
+    assert store.rows(job_id)[0]["status"] == "PENDING_RETRY"
+    assert store.rows(job_id)[0]["method"] == "IMPORT"
+    assert worker.run_once() is False
     assert gateway.imports == [["+79991234567"]]
-    assert gateway.resolves == ["+79991234567"]
-    assert store.rows(job_id)[0]["status"] == "FOUND"
+    assert gateway.resolves == []
 
 
 def test_worker_persists_temporary_gateway_failure_for_retry(tmp_path):
@@ -74,7 +73,7 @@ class BatchStore:
     def finish_batch(self, claims, results):
         self.finished.extend((claim["id"], results[claim["phone"]]) for claim in claims)
 
-    def move_batch_to_direct_lookup(self, claims):
+    def defer_import_retries(self, claims, reason):
         self.direct.extend(claim["id"] for claim in claims)
 
     def retry_claim(self, claim, error):
@@ -86,7 +85,10 @@ class BatchStore:
     def defer_account_floodwait(self, claims, seconds):
         self.flood_waits.append(([claim["id"] for claim in claims], seconds))
 
-    def claim_cleanup(self, owner):
+    def record_import_batch_success(self, job_id):
+        pass
+
+    def claim_cleanup_batch(self, owner, limit):
         return self.cleanup_claims.pop(0) if self.cleanup_claims else None
 
     def finish_cleanup(self, claim):
@@ -207,3 +209,248 @@ def test_worker_processes_durable_cleanup_separately_from_validation():
 
     assert ValidatorWorker(store, Gateway(), "test-worker").run_once() is True
     assert store.cleaned == [9]
+
+
+class Clock:
+    def __init__(self):
+        self.value = 1000.0
+
+    def __call__(self):
+        return self.value
+
+
+def test_unknown_outcome_after_dispatched_import_is_not_replayed(tmp_path):
+    from telegram_phone_number_checker.user_session import RequestOutcomeUnknownError
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("+79991234567\n+79991234567")
+    store.start(job_id)
+
+    class UnknownGateway:
+        import_calls = 0
+
+        def import_phones(self, phones):
+            self.import_calls += 1
+            raise RequestOutcomeUnknownError("transport error with sensitive details")
+
+    gateway = UnknownGateway()
+    worker = ValidatorWorker(store, gateway, "test-worker")
+    worker.run_once()
+    assert [row["status"] for row in store.rows(job_id)] == ["UNKNOWN_OUTCOME_REVIEW"] * 2
+    assert store.events(job_id)[-1]["kind"] == "UNKNOWN_OUTCOME"
+    reopened = QueueStore(store.path)
+    assert ValidatorWorker(reopened, gateway, "worker-b").run_once() is False
+    assert gateway.import_calls == 1
+    with store._connect() as connection:
+        attempts = connection.execute("SELECT * FROM job_item_attempts").fetchall()
+        assert [row["outcome"] for row in attempts] == ["UNKNOWN_OUTCOME"] * 2
+        assert all("sensitive" not in row["detail"] for row in attempts)
+
+
+def test_revoked_session_pauses_job_without_incrementing_normal_retry_count(tmp_path):
+    from telegram_phone_number_checker.user_session import UserSessionUnavailableError
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("+79991234567")
+    store.start(job_id)
+
+    class RevokedGateway:
+        def import_phones(self, phones):
+            raise UserSessionUnavailableError("OTP=secret password=secret")
+
+    worker = ValidatorWorker(store, RevokedGateway(), "test-worker")
+    worker.run_once()
+    assert store.snapshot(job_id)["state"] == "WAITING_AUTHORIZATION"
+    assert store.snapshot(job_id)["import_retry_count"] == 0
+    with store._connect() as connection:
+        assert connection.execute("SELECT attempts FROM job_items").fetchone()[0] == 0
+    assert worker.run_once() is False
+    assert "secret" not in str(store.rows(job_id)) + str(store.events(job_id))
+    store.reconcile()
+    assert store.snapshot(job_id)["state"] == "WAITING_AUTHORIZATION"
+    # Authorization alone does not touch the queue; the operator must explicitly start.
+    class AuthorizedGateway:
+        calls = 0
+        def import_phones(self, phones):
+            self.calls += 1
+            return {phones[0]: {"id": 1}}
+    gateway = AuthorizedGateway()
+    authorized_worker = ValidatorWorker(store, gateway, "test-worker")
+    assert authorized_worker.run_once() is False
+    assert store.start(job_id) is True
+    assert authorized_worker.run_once() is True
+    assert gateway.calls == 1
+
+
+def test_not_dispatched_request_uses_recoverable_path(tmp_path):
+    from telegram_phone_number_checker.user_session import RequestNotDispatchedError
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("+79991234567")
+    store.start(job_id)
+    class Gateway:
+        def import_phones(self, phones):
+            raise RequestNotDispatchedError("secret raw error")
+    ValidatorWorker(store, Gateway(), "worker").run_once()
+    assert store.rows(job_id)[0]["status"] == "RETRYABLE_ERROR"
+    assert "secret" not in str(store.rows(job_id))
+
+
+def test_five_ready_import_batches_run_before_cleanup(tmp_path):
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("\n".join(f"+79990000{i:03d}" for i in range(7)))
+    store.start(job_id)
+    store.set_import_batch_size(job_id, 1)
+    with store._connect() as connection:
+        connection.execute("INSERT INTO contact_cleanup(job_id, telegram_user_id, state, created_at) VALUES (?, 100, 'PENDING', 0)", (job_id,))
+    class Gateway:
+        calls = []
+        def import_phones(self, phones):
+            self.calls.append("IMPORT")
+            return {phone: {"id": index + 1} for index, phone in enumerate(phones)}
+        def cleanup_contacts(self, user_ids):
+            self.calls.append("CLEANUP")
+    gateway = Gateway()
+    worker = ValidatorWorker(store, gateway, "worker")
+    for _ in range(6):
+        assert worker.run_once() is True
+    assert gateway.calls == ["IMPORT"] * 5 + ["CLEANUP"]
+
+
+def test_paused_job_with_pending_cleanup_issues_no_request(tmp_path):
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("+79991234567")
+    store.start(job_id)
+    claim = store.claim_next("worker")
+    store.finish_claim(claim, {"id": 123})
+    store.pause(job_id)
+    class Gateway:
+        def cleanup_contacts(self, user_ids):
+            raise AssertionError("paused job made a Telegram request")
+    assert ValidatorWorker(store, Gateway(), "worker").run_once() is False
+
+
+def test_unknown_cleanup_outcome_is_not_replayed(tmp_path):
+    from telegram_phone_number_checker.user_session import RequestOutcomeUnknownError
+    store = QueueStore(tmp_path / "validator.db")
+    job_id = store.create_job("+79991234567")
+    store.start(job_id)
+    store.finish_claim(store.claim_next("worker"), {"id": 123})
+    class Gateway:
+        def cleanup_contacts(self, user_ids):
+            raise RequestOutcomeUnknownError("raw secret")
+    worker = ValidatorWorker(store, Gateway(), "worker")
+    assert worker.run_once() is True
+    assert worker.run_once() is False
+    assert 'неизвестен' in store.snapshot(job_id)['message']
+    with store._connect() as connection:
+        assert connection.execute("SELECT state FROM contact_cleanup").fetchone()[0] == "UNKNOWN_OUTCOME_REVIEW"
+        assert connection.execute("SELECT outcome FROM job_item_attempts ORDER BY id DESC").fetchone()[0] == "UNKNOWN_OUTCOME"
+
+
+def test_cleanup_budget_survives_worker_restart(tmp_path):
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = store.create_job('\n'.join(f'+79990000{i:03d}' for i in range(7)))
+    store.start(job_id)
+    store.set_import_batch_size(job_id, 1)
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+        def import_phones(self, phones):
+            self.calls.append('IMPORT')
+            return {phone: {'id': index + 123} for index, phone in enumerate(phones)}
+        def cleanup_contacts(self, user_ids):
+            self.calls.append('CLEANUP')
+    gateway = Gateway()
+    for _ in range(6):
+        reopened = QueueStore(store.path)
+        assert ValidatorWorker(reopened, gateway, 'worker').run_once() is True
+    assert gateway.calls == ['IMPORT'] * 5 + ['CLEANUP']
+
+
+def test_cleanup_authorization_pause_does_not_consume_failure_budget(tmp_path):
+    from telegram_phone_number_checker.user_session import UserSessionUnavailableError
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = store.create_job('+79991234567')
+    store.start(job_id)
+    store.finish_claim(store.claim_next('worker'), {'id': 123})
+    class Gateway:
+        def cleanup_contacts(self, user_ids):
+            raise UserSessionUnavailableError('raw OTP secret')
+    worker = ValidatorWorker(store, Gateway(), 'worker')
+    assert worker.run_once() is True
+    assert store.snapshot(job_id)['state'] == 'WAITING_AUTHORIZATION'
+    assert worker.run_once() is False
+    with store._connect() as connection:
+        cleanup = dict(connection.execute('SELECT * FROM contact_cleanup').fetchone())
+        assert cleanup['state'] == 'PENDING'
+        assert cleanup['attempts'] == 0
+        assert 'secret' not in cleanup['last_error']
+
+
+def test_browser_login_requires_explicit_resume_after_revocation(tmp_path):
+    import threading
+    import time
+    from urllib.parse import urlencode
+    from urllib.request import urlopen
+    from telegram_phone_number_checker.durable_web import DurableValidatorApplication, create_server
+    from telegram_phone_number_checker.user_session import UserSessionUnavailableError
+
+    class Session:
+        state = 'AUTHORIZED'
+        import_calls = 0
+        successful_imports = 0
+
+        def snapshot(self):
+            return {'state': self.state, 'message': 'Test session'}
+
+        def import_phones(self, phones):
+            self.import_calls += 1
+            if self.import_calls == 1:
+                self.state = 'NOT_AUTHORIZED'
+                raise UserSessionUnavailableError('revoked')
+            self.successful_imports += 1
+            return {phones[0]: {'id': 123}}
+
+        def cleanup_contacts(self, user_ids):
+            pass
+
+        def start_authorization(self, phone):
+            self.state = 'CODE_SENT'
+            return True
+
+        def submit_code(self, code):
+            self.state = 'AUTHORIZED'
+            return True
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(.01)
+        raise AssertionError('worker did not reach the expected durable state')
+
+    session = Session()
+    app = DurableValidatorApplication(tmp_path / 'validator.db', gateway=session, authorization=session)
+    server = create_server(app, 0)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    base_url = f'http://127.0.0.1:{server.server_port}'
+    try:
+        job_id = app.enqueue('+79991234567')
+        assert app.start(job_id)
+        wait_for(lambda: app.store.snapshot(job_id)['state'] == 'WAITING_AUTHORIZATION')
+        for path, values in [('/auth/begin', {'phone_number': '+79990000001'}), ('/auth/code', {'code': '12345'})]:
+            with urlopen(base_url + path, data=urlencode(values).encode(), timeout=2) as response:
+                assert response.status == 200
+        assert session.snapshot()['state'] == 'AUTHORIZED'
+        assert app.store.snapshot(job_id)['state'] == 'WAITING_AUTHORIZATION'
+        assert session.successful_imports == 0
+        assert app._worker.run_once() is False
+        with urlopen(base_url + f'/jobs/{job_id}/resume', data=b'', timeout=2) as response:
+            assert response.status == 200
+        wait_for(lambda: app.store.rows(job_id)[0]['status'] == 'FOUND_NO_USERNAME')
+        assert session.successful_imports == 1
+    finally:
+        server.shutdown()
+        server_thread.join(timeout=2)
+        server.server_close()
+        app.close()

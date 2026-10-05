@@ -11,6 +11,9 @@ import time
 from typing import Protocol
 
 from telethon.errors import FloodWaitError
+from telegram_phone_number_checker.user_session import (
+    UserSessionUnavailableError, RequestNotDispatchedError, RequestOutcomeUnknownError,
+)
 
 
 MAX_IMPORT_BATCH_SIZE = 10
@@ -32,14 +35,18 @@ class ValidatorWorker:
         # Avoid a second request for a duplicate that appears in a later claimed
         # batch. The store also deduplicates durable work across restarts.
         self._results_by_phone: dict[tuple[str, str], dict] = {}
+        self._import_batches_since_cleanup = 0
 
     def run_once(self) -> bool:
-        if self._run_cleanup_once():
+        cleanup_due = getattr(self.store, 'cleanup_due', None)
+        due = cleanup_due() if cleanup_due else self._import_batches_since_cleanup >= 5
+        if due and self._run_cleanup_once():
+            self._import_batches_since_cleanup = 0
             return True
 
         claims = self._claim_batch()
         if not claims:
-            return False
+            return self._run_cleanup_once()
         if claims[0]["method"] == "DIRECT_LOOKUP":
             return self._run_direct_lookup(claims)
         return self._run_import_batch(claims)
@@ -65,11 +72,19 @@ class ValidatorWorker:
         try:
             results = self._with_claim_lease(claims, lambda: self.gateway.import_phones(unique_phones))
         except FloodWaitError as error:
-            self.store.defer_account_floodwait(claims, error.seconds)
+            self.store.defer_account_floodwait(pending, error.seconds)
+            return True
+        except UserSessionUnavailableError:
+            self.store.pause_for_authorization(pending)
+            return True
+        except RequestOutcomeUnknownError:
+            self.store.defer_unknown_outcome(pending, 'IMPORT')
+            return True
+        except RequestNotDispatchedError as error:
+            self._retry(pending, error)
             return True
         except Exception as error:
-            for claim in pending:
-                self.store.retry_claim(claim, error)
+            self._retry(pending, error)
             return True
 
         normalized_results = {
@@ -85,8 +100,14 @@ class ValidatorWorker:
             self._finish(completed_claims, completed_results)
             self._remember(completed_claims, completed_results)
         if retry_claims:
-            self._move_to_direct_lookup(retry_claims)
+            self.store.defer_import_retries(retry_claims, 'retry_contacts')
             self._reduce_import_batch_size(retry_claims[0])
+        else:
+            self.store.record_import_batch_success(pending[0]['job_id'])
+        self._import_batches_since_cleanup += 1
+        completed = getattr(self.store, 'record_import_batch_completed', None)
+        if completed:
+            completed(pending[0]['account_key'])
         return True
 
     def _run_direct_lookup(self, claims: list[dict]) -> bool:
@@ -101,6 +122,12 @@ class ValidatorWorker:
             result = self._with_claim_lease([claim], lambda: self.gateway.resolve_phone(claim["phone"]))
         except FloodWaitError as error:
             self.store.defer_account_floodwait([claim], error.seconds)
+            return True
+        except UserSessionUnavailableError:
+            self.store.pause_for_authorization([claim])
+            return True
+        except RequestOutcomeUnknownError:
+            self.store.defer_unknown_outcome([claim], 'DIRECT_LOOKUP')
             return True
         except Exception as error:
             self.store.retry_claim(claim, error)
@@ -142,13 +169,13 @@ class ValidatorWorker:
         for claim in claims:
             self.store.finish_claim(claim, results[claim["phone"]])
 
-    def _move_to_direct_lookup(self, claims: list[dict]) -> None:
-        move_batch = getattr(self.store, "move_batch_to_direct_lookup", None)
-        if move_batch:
-            move_batch(claims)
-            return
-        for claim in claims:
-            self.store.move_claim_to_direct_lookup(claim)
+    def _retry(self, claims: list[dict], error: Exception) -> None:
+        retry_batch = getattr(self.store, 'retry_batch', None)
+        if retry_batch:
+            retry_batch(claims, error)
+        else:
+            for claim in claims:
+                self.store.retry_claim(claim, error)
 
     def _reduce_import_batch_size(self, claim: dict) -> None:
         current = claim.get("import_batch_size", MAX_IMPORT_BATCH_SIZE)
@@ -158,16 +185,20 @@ class ValidatorWorker:
             setter(claim["job_id"], next_size)
 
     def _run_cleanup_once(self) -> bool:
-        claim_cleanup = getattr(self.store, "claim_cleanup", None)
+        claim_cleanup = getattr(self.store, "claim_cleanup_batch", None)
         if not claim_cleanup:
             return False
-        claim = claim_cleanup(self.owner)
+        claim = claim_cleanup(self.owner, 100)
         if not claim:
             return False
         try:
             self._with_cleanup_lease(claim, lambda: self.gateway.cleanup_contacts(claim["telegram_user_ids"]))
         except FloodWaitError as error:
             self.store.defer_cleanup_floodwait(claim, error.seconds)
+        except UserSessionUnavailableError:
+            self.store.pause_cleanup_for_authorization(claim)
+        except RequestOutcomeUnknownError:
+            self.store.defer_cleanup_unknown_outcome(claim)
         except Exception as error:
             self.store.retry_cleanup(claim, error)
         else:
