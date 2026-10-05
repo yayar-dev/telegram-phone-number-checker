@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Validate pasted phone-number batches through one persistent, browser-authorized Telegram user session, without treating privacy-limited API responses as account absence.
+**Goal:** Validate batches through one browser-authorized Telegram user account with durable, rate-aware imports and truthful privacy-limited results.
 
-**Architecture:** Replace the short-lived `TelethonGateway` with a single-owner asyncio session gateway that serializes all Telegram operations through one connected Telethon user client. Preserve the SQLite queue as the authority for claims, FloodWait, retries, cleanup, and job recovery; change `retry_contacts` from a direct-lookup fallback into a persisted import retry. Add a paused-job migration and UI counts that separate confirmed, pending retry, and privacy-ambiguous results.
+**Architecture:** A single `UserSessionService` owns one asyncio loop, one Telethon user client, and the browser authorization sequence. The durable SQLite queue remains authoritative for claims, FloodWait, retry state, immutable per-item attempt history, cleanup, and recovery. Imports and cleanup run serially through that owner; unknown-outcome requests are never replayed automatically.
 
 **Tech Stack:** Python 3.12, Telethon 1.33, SQLite, stdlib `asyncio`/`threading`/`http.server`, pytest, Docker Compose.
 
@@ -12,293 +12,316 @@
 
 ## Global Constraints
 
-- Use the one browser-authorized Telegram **user account** stored at `/data/telegram-session`; do not add bots, additional accounts, or Telegram Desktop UI automation.
-- Keep the service bound to `127.0.0.1` through Compose and keep queue state in `tg-validatorForSelf_data`.
-- OTP and 2FA values remain process-memory-only; queue rows, events, CSV, and logs must not contain them.
-- Preserve Telegram `FloodWait` delays exactly; performance improvements must not suppress, parallelize around, or bypass them.
-- `UNRESOLVABLE_OR_PRIVACY` remains an API ambiguity, never a claim that a Telegram account is absent.
-- Preserve the existing paused job until the operator explicitly chooses its migration action.
+- Use one browser-authorized Telegram **user account** at `/data/telegram-session`; no bot, additional account, or Telegram Desktop UI automation.
+- Keep service access on `127.0.0.1` and retain queue/session data in `tg-validatorForSelf_data`.
+- Never write OTP, 2FA passwords, or raw authorization errors containing them to SQLite, events, CSV, logs, or HTML.
+- Preserve server-supplied `FloodWait` exactly. Do not parallelize around or bypass it.
+- `UNRESOLVABLE_OR_PRIVACY` is API ambiguity, never proof of account absence.
+- Preserve the current paused job until the operator explicitly chooses migration; no automatic restart after migration.
 
 ## Review Focus
 
-- A revoked or missing Telethon session must leave the job staged/paused with a clear authorization state, never invoke terminal `input()`; cover in Task 1.
-- A transport failure while the reusable client is connected must reconnect once and retain the original durable claim; cover in Task 1.
-- A `FloodWaitError` during import or cleanup must retain its exact server delay after restart; cover in Task 2.
-- `retry_contacts` must never call `resolvePhone` or produce a terminal privacy row before an import response; cover in Task 2.
-- Migration must not overwrite rows manually confirmed by the operator or any API-confirmed rows; cover in Task 3.
+- Missing/revoked user session pauses affected jobs and performs no terminal prompt or repeated API request.
+- A transport failure after dispatch produces an unknown-outcome retry, never an automatic replay of `ImportContactsRequest` or cleanup.
+- Legacy direct-lookup rows, including pending rows, cannot run the obsolete fallback after migration.
+- Cleanup work cannot starve imports or double Telegram RPC volume under normal throughput.
+- Stop/start during an in-flight request keeps a recoverable lease and does not leak OTP/2FA secrets.
 
 ---
 
 ## File Structure
 
-- Create `telegram_phone_number_checker/session_gateway.py`: owns the single asyncio loop and persistent Telethon user client; exposes the existing synchronous gateway protocol.
-- Modify `telegram_phone_number_checker/durable_web.py`: wires the session gateway into the application, closes it at shutdown, exposes migration action, and renders truthful result counts.
-- Modify `telegram_phone_number_checker/validator_worker.py`: defers `retry_contacts` back to import instead of invoking `resolvePhone`; raises import batch size only after persisted stable success.
-- Modify `telegram_phone_number_checker/queue_store.py`: persists import-retry state, adaptive-success counter, migration audit event, and summary counts.
-- Modify `telegram_phone_number_checker/web.py`: creates and closes the durable application around the HTTP server lifetime.
-- Modify `tests/test_validator_worker.py`, `tests/test_queue_store.py`, and `tests/test_web.py`; create `tests/test_session_gateway.py`.
-- Modify `README.md`: describe the user-session lifecycle, the meaning of each result category, and the paused-job migration control.
+- Create `telegram_phone_number_checker/user_session.py`: single session owner, browser authorization, serialized API execution, handoff, reconnect and shutdown.
+- Modify `telegram_phone_number_checker/durable_web.py`: use the session owner, render authorization/result state, migration action, and deterministic shutdown.
+- Modify `telegram_phone_number_checker/validator_worker.py`: classify request outcomes, defer import retries, and schedule cleanup after imports.
+- Modify `telegram_phone_number_checker/queue_store.py`: attempt history, `PENDING_RETRY`, adaptive import state, paused-job migration, summary counts, and authorization pause.
+- Modify `telegram_phone_number_checker/web.py`: wire application shutdown and SIGTERM-safe stop handling.
+- Create `tests/test_user_session.py`; modify `tests/test_validator_worker.py`, `tests/test_queue_store.py`, `tests/test_web.py`, and `README.md`.
 
-### Task 1: Persistent user-session gateway
+### Task 1: One session owner for authorization and validation
 
 **Files:**
-- Create: `telegram_phone_number_checker/session_gateway.py`
-- Modify: `telegram_phone_number_checker/durable_web.py:135-158,161-195`
+- Create: `telegram_phone_number_checker/user_session.py`
+- Modify: `telegram_phone_number_checker/durable_web.py:18-158,161-195`
 - Modify: `telegram_phone_number_checker/web.py:760-779`
-- Create: `tests/test_session_gateway.py`
+- Create: `tests/test_user_session.py`
 - Modify: `tests/test_web.py`
 
 **Interfaces:**
-- Consumes: `upstream.get_session_name(phone_number)`, `upstream.get_names_batch`, `upstream.resolve_phone`, `upstream.cleanup_imported_contacts`, and environment API credentials.
-- Produces: `PersistentTelethonGateway.import_phones(phones: list[str]) -> dict[str, dict]`, `resolve_phone(phone: str) -> dict`, `cleanup_contacts(user_ids: list[int]) -> None`, and `close() -> None`.
-- Produces: `UserSessionUnavailableError`, raised when the persisted client session is not authorized.
+- Produces: `UserSessionService.start_authorization(phone: str) -> bool`, `submit_code(code: str) -> bool`, `submit_password(password: str) -> bool`, `snapshot() -> dict[str, str]`, `import_phones(phones: list[str]) -> dict[str, dict]`, `resolve_phone(phone: str) -> dict`, `cleanup_contacts(user_ids: list[int]) -> None`, `close(timeout: float = 5.0) -> None`.
+- Produces: `UserSessionUnavailableError`, `RequestNotDispatchedError`, and `RequestOutcomeUnknownError`.
+- Consumes: existing Telethon request helpers in `main.py`, the durable worker gateway protocol, and browser form routes.
 
-- [ ] **Step 1: Write failing gateway tests**
+- [ ] **Step 1: Write failing service tests**
 
 ```python
-def test_gateway_reuses_one_connected_client_for_two_import_calls():
-    gateway = PersistentTelethonGateway(client_factory=fake_factory)
-    gateway.import_phones(["+79990000001"])
-    gateway.import_phones(["+79990000002"])
+def test_one_authorized_client_serves_two_import_batches_and_cleanup():
+    service = UserSessionService(client_factory=fake_factory)
+    service.import_phones(["+79990000001"])
+    service.import_phones(["+79990000002"])
+    service.cleanup_contacts([1])
     assert fake_factory.created == 1
     assert fake_client.connect_calls == 1
 
 
-def test_gateway_reconnects_once_after_transport_failure_without_terminal_login():
-    gateway = PersistentTelethonGateway(client_factory=fake_factory)
-    assert gateway.import_phones(["+79990000001"])["+79990000001"]["id"] == 1
-    assert fake_factory.created == 2
+def test_authorization_handoff_keeps_same_client_for_first_import():
+    service.start_authorization("+79991112233")
+    service.submit_code("12345")
+    assert wait_until(lambda: service.snapshot()["state"] == "AUTHORIZED")
+    service.import_phones(["+79990000001"])
+    assert fake_factory.created == 1
+
+
+def test_revoked_session_raises_user_session_unavailable_without_upstream_login(monkeypatch):
+    with pytest.raises(UserSessionUnavailableError):
+        service.import_phones(["+79990000001"])
+    assert upstream.login_calls == 0
 ```
 
-Add a test that an unauthorized client raises `UserSessionUnavailableError` and proves `upstream.login` was not called.
+Add a shutdown test that starts one blocking operation, calls `close()`, and proves the operation returns a recoverable exception and the client disconnects once.
 
-- [ ] **Step 2: Run the new gateway tests to verify they fail**
+- [ ] **Step 2: Run the new service tests to verify they fail**
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_session_gateway.py`
+Run: activate the project virtual environment, then `python -m pytest -q tests/test_user_session.py`
 
-Expected: FAIL because `PersistentTelethonGateway` does not exist.
+Expected: FAIL because `UserSessionService` does not exist.
 
-- [ ] **Step 3: Implement `PersistentTelethonGateway`**
+- [ ] **Step 3: Implement the unified session owner**
 
-Implement the exact protocol above in a dedicated background asyncio loop. Each public method submits one coroutine to that loop and waits for its result; the loop owns the only live Telethon client. Create the client from `TELEGRAM_SESSION_PATH`, `API_ID`, `API_HASH`, and optional `PROXY`; call `connect()` and `is_user_authorized()` before the first request. Recreate the client once after an `OSError` or Telethon transport disconnect, then replay only that uncompleted operation. Do not call `upstream.login` or any terminal prompt. `close()` disconnects the client and stops the loop.
+Run one asyncio loop in one background thread. The service owns the only Telethon client for both phone/OTP/2FA and validation. Browser authorization uses `send_code_request`, `sign_in`, and optional password on that same loop; it exposes `AUTHORIZED` only after the client remains connected and `is_user_authorized()` succeeds. Validation operations submit coroutines serially to that loop and never call `upstream.login` or `input()`.
 
-- [ ] **Step 4: Replace `TelethonGateway` application wiring**
+On a connect failure before any request dispatch, raise `RequestNotDispatchedError`; on a disconnect/error after the coroutine is dispatched, raise `RequestOutcomeUnknownError`. Do not replay the operation in the service. `close()` sets a stop flag, rejects new work, waits up to its timeout for the active operation, disconnects the client, and stops the loop.
 
-Instantiate `PersistentTelethonGateway` in `DurableValidatorApplication` when no test gateway is supplied. Add `DurableValidatorApplication.close() -> None`; call it from `web.main()` after `server_close()`. Keep test injection compatible.
+- [ ] **Step 4: Wire service lifecycle into the application**
 
-- [ ] **Step 5: Run targeted tests and commit**
+Replace `TelegramAuthorization` plus short-lived `TelethonGateway` with a shared `UserSessionService`; retain the existing browser endpoints and dependency injection for tests. Add `DurableValidatorApplication.close()`. In `web.main()`, install a SIGTERM handler that stops `serve_forever()`, then calls application close after the server stops accepting requests.
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_session_gateway.py tests/test_web.py`
+- [ ] **Step 5: Verify and commit**
+
+Run: `python -m pytest -q tests/test_user_session.py tests/test_web.py`
 
 Expected: PASS.
 
 ```bash
-git add telegram_phone_number_checker/session_gateway.py telegram_phone_number_checker/durable_web.py telegram_phone_number_checker/web.py tests/test_session_gateway.py tests/test_web.py
-git commit -m "feat: reuse authenticated Telegram user session"
+git add telegram_phone_number_checker/user_session.py telegram_phone_number_checker/durable_web.py telegram_phone_number_checker/web.py tests/test_user_session.py tests/test_web.py
+git commit -m "feat: own Telegram user session persistently"
 ```
 
-### Task 2: Preserve import retries and adaptive throughput
+### Task 2: Durable request outcome, import retry, and cleanup scheduling
 
 **Files:**
-- Modify: `telegram_phone_number_checker/queue_store.py:466-523,592-622,734-742`
-- Modify: `telegram_phone_number_checker/validator_worker.py:16-17,57-90,145-158`
+- Modify: `telegram_phone_number_checker/queue_store.py:466-523,536-622,624-742,744-924`
+- Modify: `telegram_phone_number_checker/validator_worker.py:16-175`
 - Modify: `tests/test_queue_store.py`
 - Modify: `tests/test_validator_worker.py`
 
 **Interfaces:**
-- Consumes: `ValidatorWorker._run_import_batch(claims)` and `QueueStore.claim_batch(owner, limit, account_key)`.
-- Produces: `QueueStore.defer_import_retries(claims: list[dict]) -> None`, `QueueStore.record_import_batch_success(job_id: str) -> None`, and `QueueStore.record_import_retry(job_id: str) -> None`.
-- Produces: visible nonterminal status `PENDING_RETRY`; `claim_batch` accepts it when `next_attempt_at` is due.
+- Produces: `QueueStore.defer_import_retries(claims: list[dict], reason: str) -> None`, `defer_unknown_outcome(claims: list[dict], method: str) -> None`, `pause_for_authorization(claims: list[dict]) -> None`, `record_import_batch_success(job_id: str) -> None`, and `claim_cleanup_batch(owner: str, limit: int) -> dict | None`.
+- Produces: nonterminal row status `PENDING_RETRY`; ready SQL accepts it only when its persisted `next_attempt_at` is due.
 
-- [ ] **Step 1: Write failing retry-routing tests**
+- [ ] **Step 1: Write failing worker/store tests**
 
 ```python
 def test_retry_contacts_return_to_import_queue_without_resolve_phone():
-    worker = ValidatorWorker(store, gateway, "owner")
     worker.run_once()
     assert gateway.resolve_calls == []
     assert store.rows(job_id)[0]["status"] == "PENDING_RETRY"
     assert store.rows(job_id)[0]["method"] == "IMPORT"
 
 
-def test_retry_contact_reduces_batch_then_successes_restore_batch_size():
-    # 10 -> 5 -> 1 after two retry responses; five successful import batches restore 1 -> 5.
-    assert store.snapshot(job_id)["import_batch_size"] == 5
+def test_unknown_outcome_after_dispatched_import_is_not_replayed():
+    worker.run_once()
+    assert gateway.import_calls == 1
+    assert store.rows(job_id)[0]["status"] == "PENDING_RETRY"
+    assert store.events(job_id)[-1]["kind"] == "UNKNOWN_OUTCOME"
+
+
+def test_revoked_session_pauses_job_without_incrementing_normal_retry_count():
+    worker.run_once()
+    assert store.snapshot(job_id)["state"] == "WAITING_AUTHORIZATION"
 ```
 
-Add a `FloodWaitError(seconds=230)` test proving the persisted `resume_after` equals `now + 230` and that no retry state bypasses it.
+Add tests for a 230-second `FloodWait`, five successful batches restoring 1 → 5 then 5 → 10, cancellation of `PENDING_RETRY`, and five ready import batches running before one cleanup batch.
 
-- [ ] **Step 2: Run retry-routing tests to verify they fail**
+- [ ] **Step 2: Run those tests to verify they fail**
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_validator_worker.py tests/test_queue_store.py -k 'retry or batch or flood'`
+Run: `python -m pytest -q tests/test_validator_worker.py tests/test_queue_store.py -k 'retry or unknown or authorization or cleanup or flood or batch'`
 
-Expected: FAIL because retry contacts currently become `DIRECT_LOOKUP`.
+Expected: FAIL because retry contacts currently enter `DIRECT_LOOKUP` and cleanup has strict priority.
 
-- [ ] **Step 3: Implement persisted import retry behavior**
+- [ ] **Step 3: Implement safe outcome routing**
 
-Add `PENDING_RETRY` to the ready/duplicate-safe SQL predicates. `defer_import_retries` keeps `method='IMPORT'`, sets `next_attempt_at` to `now + 60` seconds for the first retry, `+300` seconds for the second, and `+900` seconds for the third and later retries, clears the lease, writes one `IMPORT_RETRY` event, and reduces the job batch size through the existing 10 → 5 → 1 sequence.
+Add `PENDING_RETRY` to claim, duplicate, pause, cancel, and recovery predicates. For `retry_contacts`, keep `method='IMPORT'`, set retry delays to 60 seconds, then 300 seconds, then 900 seconds for all later retries, and append an `IMPORT_RETRY` attempt record. On `RequestOutcomeUnknownError`, set `PENDING_RETRY` with a 300-second delay and an `UNKNOWN_OUTCOME` record; do not resend automatically. On `RequestNotDispatchedError`, use the ordinary recoverable path. On `UserSessionUnavailableError`, release claims and set the job `WAITING_AUTHORIZATION` without increasing ordinary failure counters.
 
-Replace `ValidatorWorker._move_to_direct_lookup` with `QueueStore.defer_import_retries`; do not invoke `resolve_phone` for `retry_contacts`. Add `import_success_streak INTEGER NOT NULL DEFAULT 0` to `jobs`, reset it on retry or FloodWait, and raise a job batch size after five successful import batches: 1 → 5 and 5 → 10. `record_import_batch_success` runs only after an import batch that contained no retry contacts.
+Add `import_success_streak` to `jobs`; reset it on retry, unknown outcome, or FloodWait. Five retry-free import batches restore batch size from 1 → 5 or 5 → 10. Persist all server `FloodWait` values exactly and reset the streak.
 
-- [ ] **Step 4: Run targeted tests and commit**
+Replace cleanup-first behavior with an import budget of five completed import batches before one `claim_cleanup_batch` call; cleanup remains durable, serial, and subject to the same FloodWait handling.
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_validator_worker.py tests/test_queue_store.py`
+- [ ] **Step 4: Verify and commit**
+
+Run: `python -m pytest -q tests/test_validator_worker.py tests/test_queue_store.py`
 
 Expected: PASS.
 
 ```bash
 git add telegram_phone_number_checker/queue_store.py telegram_phone_number_checker/validator_worker.py tests/test_queue_store.py tests/test_validator_worker.py
-git commit -m "fix: retry Telegram contact imports safely"
+git commit -m "fix: preserve safe import retries"
 ```
 
-### Task 3: Migrate privacy-ambiguous direct rows only on operator action
+### Task 3: Immutable attempt history and paused-job migration
 
 **Files:**
-- Modify: `telegram_phone_number_checker/queue_store.py:291-348,849-924`
+- Modify: `telegram_phone_number_checker/queue_store.py:50-120,291-348,849-924`
 - Modify: `telegram_phone_number_checker/durable_web.py:237-300,380-470`
 - Modify: `tests/test_queue_store.py`
 - Modify: `tests/test_web.py`
 
 **Interfaces:**
-- Consumes: paused job id.
-- Produces: `QueueStore.requeue_privacy_direct_rows(job_id: str) -> int` and `DurableValidatorApplication.requeue_privacy_direct_rows(job_id: str) -> int`.
-- Produces: `POST /jobs/<job_id>/requeue-privacy`, valid only for a `PAUSED` job.
+- Produces: `QueueStore.record_item_attempt(...) -> None`, `item_attempts(job_id: str, item_id: str) -> list[dict]`, and `requeue_legacy_direct_rows(job_id: str) -> int`.
+- Produces: `POST /jobs/<job_id>/requeue-legacy-direct`, accepted only for a paused job with no active claims.
 
-- [ ] **Step 1: Write failing migration tests**
+- [ ] **Step 1: Write failing migration/audit tests**
 
 ```python
-def test_requeue_privacy_direct_rows_preserves_manual_confirmation_and_api_history():
-    moved = store.requeue_privacy_direct_rows(job_id)
-    assert moved == 1
-    assert migrated["status"] == "PENDING_RETRY"
-    assert migrated["method"] == "IMPORT"
-    assert migrated["api_status"] == "UNRESOLVABLE_OR_PRIVACY"
-    assert manually_confirmed_row["status"] == "UNRESOLVABLE_OR_PRIVACY"
+def test_migration_requeues_legacy_pending_and_privacy_direct_rows_with_history():
+    moved = store.requeue_legacy_direct_rows(job_id)
+    assert moved == 2
+    assert pending_direct["status"] == "PENDING_RETRY"
+    assert privacy_direct["method"] == "IMPORT"
+    assert store.item_attempts(job_id, privacy_direct["_item_id"])[-1]["outcome"] == "UNRESOLVABLE_OR_PRIVACY"
+
+
+def test_migration_keeps_manual_confirmation_and_api_matches_unchanged():
+    assert store.requeue_legacy_direct_rows(job_id) == 0
 ```
 
-Add an HTTP test showing that a paused job renders a `requeue-privacy` action and redirects back to that job after a successful POST; a running job must return 404 and move no rows.
+Add a page test for migration action visibility only when paused/no claims and an HTTP test proving a running or in-progress job moves no row.
 
 - [ ] **Step 2: Run migration tests to verify they fail**
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_queue_store.py tests/test_web.py -k 'requeue_privacy'`
+Run: `python -m pytest -q tests/test_queue_store.py tests/test_web.py -k 'legacy_direct or item_attempts'`
 
-Expected: FAIL because the migration action does not exist.
+Expected: FAIL because immutable item history and migration do not exist.
 
-- [ ] **Step 3: Implement auditable migration**
+- [ ] **Step 3: Implement audit-safe migration**
 
-Within one SQLite transaction, require `jobs.state='PAUSED'`. Move only rows with `status='UNRESOLVABLE_OR_PRIVACY'`, `method='DIRECT_LOOKUP'`, and `manual_confirmation!='MANUAL_CHAT_CONFIRMED'` to `status='PENDING_RETRY'`, `method='IMPORT'`, and `next_attempt_at=now + 60`; keep `api_status` as `UNRESOLVABLE_OR_PRIVACY`, clear current display fields, and append one `MIGRATE_PRIVACY_DIRECT` job event with the moved count. Do not change API-confirmed rows or manually confirmed rows.
+Create `job_item_attempts` with item id, timestamp, method, outcome, detail, and source; append it for every terminal API result, retry, FloodWait, unknown outcome, and migration. Retain `api_status` as the current last API outcome, but do not treat it as history.
 
-Render a button labelled `Вернуть API-неопределённые номера в очередь импорта` only for paused jobs with eligible rows. Show the moved count after redirect. Do not automatically resume the job.
+For an eligible paused job with zero active claims, migrate every legacy `DIRECT_LOOKUP` row in `PENDING`, `RETRYABLE_ERROR`, or `UNRESOLVABLE_OR_PRIVACY` to `PENDING_RETRY` + `IMPORT` + `next_attempt_at=now+60`. Exclude rows with `MANUAL_CHAT_CONFIRMED` and API-confirmed rows. Append a row-level migration attempt and job-level summary event. Do not auto-resume.
 
-- [ ] **Step 4: Run targeted tests and commit**
+- [ ] **Step 4: Render and verify the operator action**
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_queue_store.py tests/test_web.py`
+Expose `Вернуть старые прямые проверки в очередь импорта` only for an eligible paused job. If a claim is still in progress, show the exact reason and no action. On success, display the moved count and retain a CSV-downloadable current status.
+
+Run: `python -m pytest -q tests/test_queue_store.py tests/test_web.py`
 
 Expected: PASS.
 
 ```bash
 git add telegram_phone_number_checker/queue_store.py telegram_phone_number_checker/durable_web.py tests/test_queue_store.py tests/test_web.py
-git commit -m "feat: requeue privacy-limited user-session checks"
+git commit -m "feat: migrate legacy direct validation safely"
 ```
 
-### Task 4: Make queue results and speed claims truthful
+### Task 4: Truthful result summary and operator flow
 
 **Files:**
 - Modify: `telegram_phone_number_checker/queue_store.py:252-304`
 - Modify: `telegram_phone_number_checker/durable_web.py:200-214,380-440`
+- Modify: `README.md`
 - Modify: `tests/test_queue_store.py`
 - Modify: `tests/test_web.py`
 
 **Interfaces:**
-- Produces: `QueueStore.result_summary(job_id: str) -> dict[str, int]` with `api_confirmed`, `pending_retry`, `privacy_ambiguous`, and `pending_import`.
-- Consumes: the result summary in `DurableValidatorApplication.snapshot(job_id)` and `_render_page`.
+- Produces: `QueueStore.result_summary(job_id: str) -> dict[str, int]` with `api_confirmed`, `pending_retry`, `privacy_ambiguous`, `pending_import`, `waiting_authorization`, and `unknown_outcome`.
 
-- [ ] **Step 1: Write failing summary and UI tests**
+- [ ] **Step 1: Write failing summary/UI tests**
 
 ```python
-def test_result_summary_separates_api_matches_from_privacy_ambiguity():
+def test_result_summary_separates_api_confirmation_from_privacy_and_retry():
     assert store.result_summary(job_id) == {
         "api_confirmed": 2,
         "pending_retry": 3,
         "privacy_ambiguous": 4,
         "pending_import": 5,
+        "waiting_authorization": 0,
+        "unknown_outcome": 1,
     }
 ```
 
-Add a page test asserting `Подтверждено API: 2`, `API не определил из-за приватности: 4`, and `Повторный импорт ожидают: 3`; assert that no text equates the privacy count to absence.
+Add page assertions for `Подтверждено API`, `API не определил из-за приватности`, `Повторный импорт ожидают`, and `Требуется повторная авторизация`; assert it never labels a privacy result as absent.
 
 - [ ] **Step 2: Run summary tests to verify they fail**
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_queue_store.py tests/test_web.py -k 'result_summary or privacy_ambiguity'`
+Run: `python -m pytest -q tests/test_queue_store.py tests/test_web.py -k 'result_summary or privacy_ambiguity or authorization'`
 
 Expected: FAIL because `result_summary` is missing.
 
-- [ ] **Step 3: Implement result summary and UI copy**
+- [ ] **Step 3: Implement summary, copy, and documentation**
 
-Count `FOUND` and `FOUND_NO_USERNAME` as `api_confirmed`; count `PENDING_RETRY` separately; count `UNRESOLVABLE_OR_PRIVACY` separately; count pending import rows whose method is `IMPORT`. Render these counts next to existing progress and retain the full status table/CSV. Keep ETA derived only from persisted queue state and append `без гарантии прохождения серверного лимита Telegram` whenever a rate wait or retry set is present.
+Count `FOUND` and `FOUND_NO_USERNAME` as API-confirmed, `PENDING_RETRY` separately, `UNRESOLVABLE_OR_PRIVACY` separately, and pending `IMPORT` rows separately. Suppress a confident completion ETA whenever retry, unknown-outcome, FloodWait, or authorization wait exists; show the stored reason and next attempt instead. Document browser authorization, paused-job migration, manual confirmation, privacy ambiguity, and Docker stop/start.
 
-- [ ] **Step 4: Run targeted tests and commit**
+- [ ] **Step 4: Verify and commit**
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_queue_store.py tests/test_web.py`
+Run: `python -m pytest -q tests/test_queue_store.py tests/test_web.py`
 
 Expected: PASS.
 
 ```bash
-git add telegram_phone_number_checker/queue_store.py telegram_phone_number_checker/durable_web.py tests/test_queue_store.py tests/test_web.py
-git commit -m "feat: clarify API and privacy validation results"
+git add telegram_phone_number_checker/queue_store.py telegram_phone_number_checker/durable_web.py README.md tests/test_queue_store.py tests/test_web.py
+git commit -m "feat: explain user-session validation outcomes"
 ```
 
-### Task 5: End-to-end verification and operator documentation
+### Task 5: Full lifecycle and Docker acceptance
 
 **Files:**
-- Modify: `README.md`
+- Modify: `tests/test_user_session.py`
+- Modify: `tests/test_validator_worker.py`
 - Modify: `tests/test_web.py`
-- Modify: `tests/test_session_gateway.py`
 
 **Interfaces:**
-- Consumes: Tasks 1-4 runtime interfaces and Docker Compose configuration.
-- Produces: documented operator flow: browser authorization, paused-job migration, resume, rate-wait interpretation, manual confirmation.
+- Consumes: Tasks 1-4.
+- Produces: verified local Docker lifecycle evidence.
 
-- [ ] **Step 1: Write failing lifecycle smoke test**
+- [ ] **Step 1: Write a failing end-to-end lifecycle test**
 
 ```python
-def test_paused_job_migrates_then_resumes_through_persistent_authorized_gateway():
-    # Assert no new client is created across migration, import retry, and cleanup.
+def test_paused_legacy_job_migrates_authorizes_and_resumes_without_new_client():
+    # It migrates legacy direct rows, waits for authorization, imports with one client,
+    # preserves an unknown outcome, and leaves manually confirmed rows unchanged.
     assert fake_factory.created == 1
-    assert app.snapshot(job_id)["result_summary"]["api_confirmed"] == 1
 ```
 
-- [ ] **Step 2: Run the lifecycle test to verify it fails**
+Add a restart test that stops the application while one import lease is active, opens the same database in a new application, and proves no item is lost or double-finished.
 
-Run: `/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q tests/test_web.py tests/test_session_gateway.py -k lifecycle`
+- [ ] **Step 2: Run lifecycle tests to verify they fail**
+
+Run: `python -m pytest -q tests/test_user_session.py tests/test_validator_worker.py tests/test_web.py -k 'lifecycle or restart'`
 
 Expected: FAIL until Tasks 1-4 are integrated.
 
-- [ ] **Step 3: Document the operator flow**
-
-Document the user-account session lifecycle, explicit migration button, difference between API confirmation and privacy ambiguity, manual confirmation, and `docker compose stop`/`start`. Do not claim that a Telegram profile is absent when the API returns a privacy-limited result.
-
-- [ ] **Step 4: Run full verification, Docker smoke, and commit**
+- [ ] **Step 3: Run full acceptance and commit**
 
 Run:
 
 ```bash
-/Users/jared/.codex/worktrees/local-web-validator/tg-validator/.venv/bin/python -m pytest -q
+python -m pytest -q
 docker compose up -d --build
 curl --silent --show-error --fail http://127.0.0.1:8010/ > /tmp/tg-validator-home.html
-rg -n "Подтверждено API|Вернуть API-неопределённые" /tmp/tg-validator-home.html
+docker compose stop
+docker compose start
+curl --silent --show-error --fail http://127.0.0.1:8010/ > /tmp/tg-validator-restarted.html
 ```
 
-Expected: pytest passes, Compose reports `tg-validatorForSelf` running, local HTTP returns 200, and the page contains the new labels when rendering a paused migrated job fixture.
+Expected: all tests pass; both HTTP calls return 200; `docker compose ps` reports `tg-validatorForSelf` running; the named volume preserves the queue/session paths across stop/start.
 
 ```bash
-git add README.md tests/test_web.py tests/test_session_gateway.py
-git commit -m "docs: explain persistent user-session validation"
+git add tests/test_user_session.py tests/test_validator_worker.py tests/test_web.py
+git commit -m "test: cover persistent user-session lifecycle"
 ```
 
 ## Self-Review
 
-- Spec coverage: Task 1 covers the persistent user session; Task 2 covers rate-aware imports; Task 3 covers explicit migration; Task 4 covers truthful result categories; Task 5 covers integration and operator documentation.
-- Type consistency: the gateway preserves the existing worker protocol; new QueueStore and application methods are named consistently across later tasks.
-- Review Focus: every listed failure mode has a named test in its owning task.
-- Proportion: no task embeds implementation bodies beyond the durable scheduling values the spec requires.
+- Spec coverage: Task 1 owns the one user session and secure handoff; Task 2 owns rate-aware scheduling and unknown outcomes; Task 3 owns per-item history and migration; Task 4 owns truthful operator output; Task 5 proves restart behavior.
+- CTO blockers: pending legacy direct rows, unknown request outcomes, revoked sessions, durable attempt history, authorization handoff, deterministic shutdown, cleanup starvation, visible retry policy, and full acceptance coverage each have an explicit task and test.
+- Type consistency: the worker continues to consume the existing synchronous gateway protocol while the session owner encapsulates its asyncio loop.
+- Scope: no multi-account dispatch, bot workflow, or client UI automation is included.
