@@ -7,6 +7,7 @@ import inspect
 import io
 import json
 import os
+import signal
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -764,21 +765,33 @@ def main() -> None:
     port = get_port()
     data_dir = get_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
+    application = DurableValidatorApplication(
+        data_dir / ".validator.db",
+        legacy_json_path=data_dir / ".validator-jobs.json",
+    )
     server = create_durable_server(
-        DurableValidatorApplication(
-            data_dir / ".validator.db",
-            legacy_json_path=data_dir / ".validator-jobs.json",
-        ),
+        application,
         host=get_host(),
         port=port,
     )
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def stop_server(signum, frame):
+        # shutdown() waits for serve_forever(), so it must run on another thread.
+        Thread(target=server.shutdown, name="validator-shutdown", daemon=True).start()
+
+    signal.signal(signal.SIGTERM, stop_server)
     print(f"Откройте http://127.0.0.1:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        try:
+            server.server_close()
+        finally:
+            application.close()
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

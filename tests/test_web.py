@@ -10,11 +10,10 @@ import pytest
 from telegram_phone_number_checker import web
 from telegram_phone_number_checker.durable_web import (
     DurableValidatorApplication,
-    TelegramAuthorization,
-    TelethonGateway,
     create_server as create_durable_server,
 )
 from telegram_phone_number_checker.queue_store import QueueStore
+from telegram_phone_number_checker.user_session import UserSessionService
 
 
 class _BlockingGateway:
@@ -40,21 +39,28 @@ class _AuthorizationClient:
         self.code_requested = False
         self.signed_in_with = ""
         self.disconnected = False
+        self.authorized = False
+        self.connected = False
 
     async def connect(self):
-        return None
+        self.connected = True
+
+    def is_connected(self):
+        return self.connected
 
     async def is_user_authorized(self):
-        return False
+        return self.authorized
 
     async def send_code_request(self, phone):
         self.code_requested = phone
 
     async def sign_in(self, phone, code):
         self.signed_in_with = (phone, code)
+        self.authorized = True
 
     async def disconnect(self):
         self.disconnected = True
+        self.connected = False
 
 
 class _TwoFactorAuthorizationClient(_AuthorizationClient):
@@ -66,6 +72,7 @@ class _TwoFactorAuthorizationClient(_AuthorizationClient):
         if password is None:
             raise web.upstream.errors.SessionPasswordNeededError(None)
         self.password = password
+        self.authorized = True
 
 
 def test_telegram_authorization_accepts_code_from_web_memory(monkeypatch):
@@ -73,9 +80,9 @@ def test_telegram_authorization_accepts_code_from_web_memory(monkeypatch):
     monkeypatch.setenv("API_HASH", "hash")
     monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
     client = _AuthorizationClient()
-    authorization = TelegramAuthorization(client_factory=lambda *args, **kwargs: client)
+    authorization = UserSessionService(client_factory=lambda *args, **kwargs: client)
 
-    assert authorization.begin("+79991112233") is True
+    assert authorization.start_authorization("+79991112233") is True
     for _ in range(20):
         if authorization.snapshot()["state"] == "CODE_SENT":
             break
@@ -89,17 +96,19 @@ def test_telegram_authorization_accepts_code_from_web_memory(monkeypatch):
 
     assert client.code_requested == "+79991112233"
     assert client.signed_in_with == ("+79991112233", "12345")
-    assert client.disconnected is True
+    assert client.disconnected is False
     assert authorization.snapshot()["state"] == "AUTHORIZED"
+    authorization.close()
+    assert client.disconnected is True
 
 
 def test_telegram_authorization_accepts_two_factor_password_from_web_memory(monkeypatch):
     monkeypatch.setenv("API_ID", "1")
     monkeypatch.setenv("API_HASH", "hash")
     client = _TwoFactorAuthorizationClient()
-    authorization = TelegramAuthorization(client_factory=lambda *args, **kwargs: client)
+    authorization = UserSessionService(client_factory=lambda *args, **kwargs: client)
 
-    assert authorization.begin("+79991112233") is True
+    assert authorization.start_authorization("+79991112233") is True
     for _ in range(20):
         if authorization.snapshot()["state"] == "CODE_SENT":
             break
@@ -118,6 +127,7 @@ def test_telegram_authorization_accepts_two_factor_password_from_web_memory(monk
 
     assert client.password == "secret-password"
     assert authorization.snapshot()["state"] == "AUTHORIZED"
+    authorization.close()
 
 
 class _CodeSentAuthorization:
@@ -326,12 +336,9 @@ def test_durable_web_submits_two_factor_password_from_browser(tmp_path):
 def test_durable_gateway_defers_contact_cleanup_to_the_durable_worker(monkeypatch):
     calls = []
 
-    class Client:
-        async def disconnect(self):
-            return None
-
-    async def login(*args):
-        return Client()
+    class Client(_AuthorizationClient):
+        async def is_user_authorized(self):
+            return True
 
     async def get_names_batch(client, phones, *, cleanup_contacts):
         calls.append(("import", phones, cleanup_contacts))
@@ -342,19 +349,18 @@ def test_durable_gateway_defers_contact_cleanup_to_the_durable_worker(monkeypatc
 
     monkeypatch.setenv("API_ID", "1")
     monkeypatch.setenv("API_HASH", "hash")
-    monkeypatch.setenv("PHONE_NUMBER", "+79990000000")
-    monkeypatch.setattr(web.upstream, "login", login)
-    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch, raising=False)
-    monkeypatch.setattr(web.upstream, "cleanup_imported_contacts", cleanup_imported_contacts, raising=False)
-
-    gateway = TelethonGateway()
-    gateway.import_phones(["+79991234567"])
-    gateway.cleanup_contacts([123])
-
-    assert calls == [
-        ("import", ["+79991234567"], False),
-        ("cleanup", [123]),
-    ]
+    monkeypatch.setattr(web.upstream, "get_names_batch", get_names_batch)
+    monkeypatch.setattr(web.upstream, "cleanup_imported_contacts", cleanup_imported_contacts)
+    gateway = UserSessionService(client_factory=lambda *args, **kwargs: Client())
+    try:
+        assert gateway.import_phones(["+79991234567"])["+79991234567"]["_cleanup_contact_id"] == 123
+        gateway.cleanup_contacts([123])
+        assert calls == [
+            ("import", ["+79991234567"], False),
+            ("cleanup", [123]),
+        ]
+    finally:
+        gateway.close()
 
 
 def test_durable_job_page_shows_partial_rows_counts_and_controls_while_running(tmp_path):
@@ -1164,3 +1170,84 @@ def test_uses_configured_listen_host(monkeypatch):
     monkeypatch.setenv("TELEGRAM_VALIDATOR_HOST", "0.0.0.0")
 
     assert web.get_host() == "0.0.0.0"
+
+
+def test_default_durable_application_shares_session_and_closes_it(tmp_path):
+    from telegram_phone_number_checker.user_session import UserSessionService
+    app = DurableValidatorApplication(tmp_path / 'validator.db')
+    try:
+        assert isinstance(app.gateway, UserSessionService)
+        assert app.authorization is app.gateway
+    finally:
+        app.close()
+    assert not app._worker_thread.is_alive()
+
+
+def test_browser_authorization_does_not_start_waiting_job(tmp_path):
+    class Session(_CodeSentAuthorization):
+        def __init__(self):
+            super().__init__()
+            self.state = 'CODE_SENT'
+            self.calls = []
+        def snapshot(self):
+            return {'state': self.state, 'message': 'Введите код из Telegram.'}
+        def submit_code(self, code):
+            self.state = 'AUTHORIZED'
+            return True
+        def import_phones(self, phones):
+            self.calls.append(phones)
+            return {phone: {'error': 'No response'} for phone in phones}
+        def cleanup_contacts(self, ids):
+            pass
+        def close(self):
+            pass
+    session = Session()
+    app = DurableValidatorApplication(tmp_path / 'validator.db', gateway=session, authorization=session)
+    try:
+        job_id = app.enqueue('+79991234567')
+        assert not app.start(job_id)
+        assert app.submit_authorization_code('12345')
+        time.sleep(.05)
+        assert session.calls == []
+        assert app.snapshot(job_id)['state'] == 'STAGED'
+        assert app.start(job_id)
+    finally:
+        app.close()
+
+
+def test_web_main_sigterm_shutdown_runs_on_helper_thread_and_closes_application(monkeypatch, tmp_path):
+    import signal
+    from threading import Event, get_ident
+    from telegram_phone_number_checker import durable_web
+    events = []
+    handler = {}
+    stopped = Event()
+    main_thread = get_ident()
+    class App:
+        def __init__(self, *args, **kwargs):
+            pass
+        def close(self):
+            events.append('app-close')
+    class Server:
+        def serve_forever(self):
+            events.append('serve')
+            handler['sigterm'](signal.SIGTERM, None)
+            assert stopped.wait(2)
+            events.append('serve-stopped')
+        def shutdown(self):
+            assert get_ident() != main_thread
+            events.append('shutdown')
+            stopped.set()
+        def server_close(self):
+            events.append('server-close')
+    previous_handler = object()
+    monkeypatch.setattr(signal, 'getsignal', lambda *_: previous_handler)
+    def install(sig, callback):
+        if callback is not previous_handler:
+            handler['sigterm'] = callback
+    monkeypatch.setattr(signal, 'signal', install)
+    monkeypatch.setattr(durable_web, 'DurableValidatorApplication', App)
+    monkeypatch.setattr(durable_web, 'create_server', lambda *args, **kwargs: Server())
+    monkeypatch.setenv('TELEGRAM_VALIDATOR_DATA_DIR', str(tmp_path))
+    web.main()
+    assert events == ['serve', 'shutdown', 'serve-stopped', 'server-close', 'app-close']

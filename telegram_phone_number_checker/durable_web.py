@@ -2,160 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
 import html
-import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Thread
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
-from telegram_phone_number_checker import main as upstream
 from telegram_phone_number_checker import web
 from telegram_phone_number_checker.queue_store import QueueStore
 from telegram_phone_number_checker.validator_worker import ValidatorWorker
-from telegram_phone_number_checker.web_service import is_valid_phone, normalize_phone_line
-
-
-class TelegramAuthorization:
-    """One-time web authorization flow; submitted codes stay only in memory."""
-
-    def __init__(self, client_factory=None):
-        self._client_factory = client_factory or upstream.TelegramClient
-        self._lock = Lock()
-        self._code_ready = Event()
-        self._password_ready = Event()
-        self._code = ""
-        self._password = ""
-        self._phone_number = ""
-        self._state = "NOT_AUTHORIZED"
-        self._message = "Подключите Telegram, чтобы получить код авторизации."
-
-    def snapshot(self) -> dict[str, str]:
-        with self._lock:
-            return {"state": self._state, "message": self._message}
-
-    def begin(self, phone_number: str | None = None) -> bool:
-        phone_number = normalize_phone_line(phone_number or os.getenv("PHONE_NUMBER", ""))
-        if not is_valid_phone(phone_number):
-            self._set_state("ERROR", "Введите номер Telegram в международном формате, например +79991234567.")
-            return False
-        with self._lock:
-            if self._state in {"REQUESTING_CODE", "CODE_SENT", "PASSWORD_REQUIRED"}:
-                return False
-            self._state = "REQUESTING_CODE"
-            self._message = "Запрашиваем код у Telegram…"
-            self._code = ""
-            self._password = ""
-            self._phone_number = phone_number
-            self._code_ready.clear()
-            self._password_ready.clear()
-        Thread(target=self._authorize, name="telegram-authorization", daemon=True).start()
-        return True
-
-    def submit_password(self, password: str) -> bool:
-        if not password:
-            return False
-        with self._lock:
-            if self._state != "PASSWORD_REQUIRED":
-                return False
-            self._password = password
-            self._state = "VERIFYING_PASSWORD"
-            self._message = "Проверяем пароль 2FA…"
-            self._password_ready.set()
-        return True
-
-    def submit_code(self, code: str) -> bool:
-        clean_code = "".join(character for character in code if character.isdigit())
-        if not clean_code:
-            return False
-        with self._lock:
-            if self._state != "CODE_SENT":
-                return False
-            self._code = clean_code
-            self._state = "VERIFYING_CODE"
-            self._message = "Проверяем код Telegram…"
-            self._code_ready.set()
-        return True
-
-    def _set_state(self, state: str, message: str) -> None:
-        with self._lock:
-            self._state = state
-            self._message = message
-
-    def _authorize(self) -> None:
-        try:
-            asyncio.run(self._authorize_async())
-        except Exception as error:
-            self._set_state("ERROR", f"Не удалось авторизовать Telegram: {error}")
-
-    async def _authorize_async(self) -> None:
-        api_id = os.getenv("API_ID")
-        api_hash = os.getenv("API_HASH")
-        with self._lock:
-            phone_number = self._phone_number
-        if not api_id or not api_hash or not phone_number:
-            self._set_state("ERROR", "Не заданы API_ID, API_HASH или PHONE_NUMBER в .env.")
-            return
-        proxy = os.getenv("PROXY")
-        client = self._client_factory(
-            upstream.get_session_name(phone_number),
-            api_id,
-            api_hash,
-            proxy=upstream.parse_proxy(proxy) if proxy else None,
-            flood_sleep_threshold=0,
-        )
-        try:
-            await client.connect()
-            if await client.is_user_authorized():
-                self._set_state("AUTHORIZED", "Telegram подключён.")
-                return
-            await client.send_code_request(phone_number)
-            self._set_state("CODE_SENT", "Введите код из Telegram.")
-            await asyncio.to_thread(self._code_ready.wait)
-            with self._lock:
-                code = self._code
-                self._code = ""
-            try:
-                await client.sign_in(phone_number, code)
-            except upstream.errors.SessionPasswordNeededError:
-                self._set_state("PASSWORD_REQUIRED", "Введите пароль двухэтапной аутентификации.")
-                await asyncio.to_thread(self._password_ready.wait)
-                with self._lock:
-                    password = self._password
-                    self._password = ""
-                await client.sign_in(password=password)
-            self._set_state("AUTHORIZED", "Telegram подключён.")
-        finally:
-            await client.disconnect()
-
-
-class TelethonGateway:
-    """Short-lived sync adapter; sessions and credentials remain owned by Telethon."""
-
-    def _call(self, operation):
-        async def run():
-            client = await upstream.login(
-                os.getenv("API_ID"), os.getenv("API_HASH"), os.getenv("PHONE_NUMBER")
-            )
-            try:
-                return await operation(client)
-            finally:
-                await client.disconnect()
-        return asyncio.run(run())
-
-    def import_phones(self, phones: list[str]) -> dict[str, dict]:
-        return self._call(
-            lambda client: upstream.get_names_batch(client, phones, cleanup_contacts=False)
-        )
-
-    def resolve_phone(self, phone: str) -> dict:
-        return self._call(lambda client: upstream.resolve_phone(client, phone))
-
-    def cleanup_contacts(self, user_ids: list[int]) -> None:
-        self._call(lambda client: upstream.cleanup_imported_contacts(client, user_ids))
+from telegram_phone_number_checker.user_session import UserSessionService
 
 
 class DurableValidatorApplication:
@@ -163,8 +21,12 @@ class DurableValidatorApplication:
         self, database_path: Path, legacy_json_path: Path | None = None, gateway=None, authorization=None
     ):
         self.store = QueueStore(database_path)
-        self.gateway = gateway or TelethonGateway()
-        self.authorization = authorization or TelegramAuthorization()
+        session = UserSessionService() if gateway is None or authorization is None else None
+        self.gateway = gateway if gateway is not None else session
+        self.authorization = authorization if authorization is not None else session
+        self._session = session
+        self._stop = Event()
+        self._worker_thread = None
         self.owner = uuid4().hex
         self._worker = ValidatorWorker(self.store, self.gateway, self.owner)
         self.startup_error = ""
@@ -182,17 +44,31 @@ class DurableValidatorApplication:
                 if diagnostic["active"]:
                     self.startup_error = str(diagnostic["message"])
         if not self.startup_error:
-            Thread(target=self._run_worker, daemon=True).start()
+            self._worker_thread = Thread(target=self._run_worker, name="validator-worker", daemon=True)
+            self._worker_thread.start()
             self.worker_started = True
 
     def _run_worker(self) -> None:
-        while True:
+        while not self._stop.is_set():
             try:
                 did_work = self._worker.run_once()
                 self.store.finalize_ready_jobs()
             except Exception:
                 did_work = False
-            time.sleep(0.2 if did_work else 1)
+            self._stop.wait(0.2 if did_work else 1)
+
+    def close(self) -> None:
+        self._stop.set()
+        resources = [self._session, self.gateway, self.authorization]
+        closed = set()
+        for resource in resources:
+            if resource is not None and id(resource) not in closed:
+                closed.add(id(resource))
+                close = getattr(resource, "close", None)
+                if close:
+                    close()
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=5)
 
     def enqueue(self, raw: str) -> str:
         return self.store.create_job(raw)
@@ -249,7 +125,8 @@ class DurableValidatorApplication:
         return True
 
     def begin_authorization(self, phone_number: str) -> bool:
-        return self.authorization.begin(phone_number)
+        start = getattr(self.authorization, "start_authorization", None) or self.authorization.begin
+        return start(phone_number)
 
     def submit_authorization_code(self, code: str) -> bool:
         return self.authorization.submit_code(code)
