@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import CancelledError, TimeoutError
+from concurrent.futures import CancelledError
 import os
 from threading import Event, Lock, Thread
 from time import monotonic
@@ -29,6 +29,7 @@ class UserSessionService:
     def __init__(self, client_factory=None):
         self._client_factory = client_factory or upstream.TelegramClient
         self._client = None
+        self._disposal_task = None
         self._state_lock = Lock()
         self._submission_lock = Lock()
         self._close_lock = Lock()
@@ -159,6 +160,8 @@ class UserSessionService:
             self._set_state('ERROR', 'Не удалось авторизовать Telegram. Повторите подключение в браузере.')
 
     async def _connect(self):
+        if self._disposal_task is not None:
+            await self._dispose_client()
         if self._client is not None and self._client.is_connected():
             return self._client
         try:
@@ -177,6 +180,9 @@ class UserSessionService:
             if not self._client.is_connected():
                 raise ConnectionError()
             return self._client
+        except FloodWaitError:
+            await self._dispose_client()
+            raise
         except UserSessionUnavailableError:
             raise
         except Exception as error:
@@ -200,6 +206,8 @@ class UserSessionService:
                 client = await self._connect()
                 try:
                     authorized = await client.is_user_authorized()
+                except FloodWaitError:
+                    raise
                 except Exception as error:
                     if self._is_revoked(error):
                         authorized = False
@@ -246,12 +254,27 @@ class UserSessionService:
         self._call(lambda client: upstream.cleanup_imported_contacts(client, user_ids))
 
     async def _dispose_client(self):
-        client, self._client = self._client, None
-        if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+        if self._disposal_task is None:
+            if self._client is None:
+                return
+            self._disposal_task = asyncio.create_task(self._disconnect_owned_client(self._client))
+        disposal = self._disposal_task
+        try:
+            # Request cancellation must not interrupt transport cleanup. A later
+            # shutdown awaits this same task, rather than disconnecting twice.
+            await asyncio.shield(disposal)
+        finally:
+            if disposal.done() and self._disposal_task is disposal:
+                self._disposal_task = None
+
+    async def _disconnect_owned_client(self, client):
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        finally:
+            if self._client is client:
+                self._client = None
 
     async def _shutdown(self):
         tasks = list(self._tasks)
@@ -263,6 +286,7 @@ class UserSessionService:
         self._set_state('NOT_AUTHORIZED', 'Telegram отключён.')
 
     def close(self, timeout: float = 5.0) -> None:
+        """Allow active work its grace period, then finish cleanup before stopping."""
         with self._close_lock:
             if self._closing.is_set():
                 return
@@ -276,9 +300,9 @@ class UserSessionService:
                 await self._shutdown()
             shutdown = asyncio.run_coroutine_threadsafe(drain(), self._loop)
             try:
-                shutdown.result(timeout=max(0, timeout) + 2)
-            except TimeoutError:
-                shutdown.cancel()
+                # The timeout bounds active work, not disconnect. Stopping the
+                # loop before cleanup completes would strand the owned session.
+                shutdown.result()
             finally:
                 self._loop.call_soon_threadsafe(self._loop.stop)
-                self._thread.join(timeout=2)
+                self._thread.join()

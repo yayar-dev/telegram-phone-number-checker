@@ -371,3 +371,77 @@ def test_authorization_failure_disposal_is_serialized_with_validation(services):
         finally:
             broken.release_disconnect.set()
         assert 'blocked phone lookup' in later.result(timeout=2)['error']
+
+
+@pytest.mark.parametrize('phase', ['connect', 'authorization_check'])
+def test_pre_dispatch_floodwait_keeps_original_server_error(services, phase):
+    flood = FloodWaitError(None, capture=137)
+    class FloodClient(Client):
+        async def is_user_authorized(self):
+            if phase == 'authorization_check':
+                raise flood
+            return await super().is_user_authorized()
+    client = FloodClient(connect_error=flood if phase == 'connect' else None)
+    service = services(Factory(client))
+    with pytest.raises(FloodWaitError) as caught:
+        service.import_phones(['+79990000001'])
+    assert caught.value is flood
+    assert caught.value.seconds == 137
+    assert client.requests == []
+
+
+@pytest.mark.parametrize('phase', ['connect', 'authorization_check'])
+def test_browser_pre_dispatch_floodwait_shows_server_duration(services, phase):
+    flood = FloodWaitError(None, capture=137)
+    class FloodClient(Client):
+        async def is_user_authorized(self):
+            if phase == 'authorization_check':
+                raise flood
+            return await super().is_user_authorized()
+    client = FloodClient(connect_error=flood if phase == 'connect' else None)
+    service = services(Factory(client))
+    assert service.start_authorization('+79991112233')
+    assert wait_until(lambda: service.snapshot()['state'] == 'ERROR')
+    assert '137 сек.' in service.snapshot()['message']
+    assert not service.start_authorization('+79991112233')
+
+
+@pytest.mark.parametrize(('client_shields_disconnect', 'release_after'), [(False, .05), (True, .05), (True, 2.1)])
+def test_close_during_error_disposal_waits_until_client_disconnects(services, client_shields_disconnect, release_after):
+    class DelayedDisconnectClient(Client):
+        def __init__(self):
+            super().__init__(request_error=ConnectionError('private transport failure'))
+            self.disconnect_started = Event()
+            self.release_disconnect = Event()
+            self.disconnect_completed = Event()
+        async def disconnect(self):
+            self.disconnect_calls += 1
+            self.disconnect_started.set()
+            async def finish():
+                while not self.release_disconnect.is_set():
+                    await asyncio.sleep(.005)
+                self.connected = False
+                self.disconnect_completed.set()
+            if client_shields_disconnect:
+                await asyncio.shield(finish())
+            else:
+                await finish()
+    client = DelayedDisconnectClient()
+    service = services(Factory(client))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        request = executor.submit(service.import_phones, ['+79990000001'])
+        assert client.disconnect_started.wait(2)
+        closing = executor.submit(service.close, timeout=.01)
+        try:
+            time.sleep(release_after)
+            assert not closing.done(), 'close returned before disconnect completed'
+            assert client.is_connected()
+        finally:
+            client.release_disconnect.set()
+        closing.result(timeout=2)
+        with pytest.raises(RequestOutcomeUnknownError):
+            request.result(timeout=2)
+    assert client.disconnect_completed.is_set()
+    assert not client.is_connected()
+    assert client.disconnect_calls == 1
+    assert not service._thread.is_alive()
