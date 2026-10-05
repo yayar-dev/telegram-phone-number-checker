@@ -318,6 +318,48 @@ class Clock:
         return self.value
 
 
+def test_same_worker_legacy_privacy_migration_imports_instead_of_using_direct_cache(tmp_path):
+    clock = Clock()
+    store = QueueStore(tmp_path / 'validator.db', now=clock)
+    phone = '+79990000001'
+    job_id = store.create_job(phone)
+    with store._connect() as connection:
+        connection.execute("UPDATE job_items SET method = 'DIRECT_LOOKUP' WHERE job_id = ?", (job_id,))
+
+    class Gateway:
+        def __init__(self):
+            self.resolves, self.imports = [], []
+        def resolve_phone(self, number):
+            self.resolves.append(number)
+            return {'error': 'No response, the phone number is not on Telegram or has blocked contact adding.'}
+        def import_phones(self, phones):
+            self.imports.append(phones)
+            return {phone: {'id': 123, 'username': 'import_match'}}
+
+    gateway = Gateway()
+    worker = ValidatorWorker(store, gateway, 'worker')
+    assert store.start(job_id)
+    assert worker.run_once()
+    assert store.rows(job_id)[0]['status'] == 'UNRESOLVABLE_OR_PRIVACY'
+    assert store.pause(job_id)
+    assert store.requeue_legacy_direct_rows(job_id) == 1
+    assert store.rows(job_id)[0]['next_attempt_at'] == 1060
+    clock.value = 1060
+    assert worker.run_once() is False  # Due alone never resumes a paused job.
+    assert store.start(job_id)
+    assert worker.run_once()
+    assert gateway.resolves == [phone]
+    assert gateway.imports == [[phone]]
+    row = store.rows(job_id)[0]
+    assert row['status'] == 'FOUND'
+    assert row['username'] == 'import_match'
+    assert [(attempt['method'], attempt['outcome']) for attempt in store.item_attempts(job_id, row['_item_id'])] == [
+        ('DIRECT_LOOKUP', 'UNRESOLVABLE_OR_PRIVACY'),
+        ('DIRECT_LOOKUP', 'UNRESOLVABLE_OR_PRIVACY'),
+        ('IMPORT', 'FOUND'),
+    ]
+
+
 def test_unknown_outcome_after_dispatched_import_is_not_replayed(tmp_path):
     from telegram_phone_number_checker.user_session import RequestOutcomeUnknownError
     store = QueueStore(tmp_path / "validator.db")

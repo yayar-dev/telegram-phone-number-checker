@@ -175,6 +175,12 @@ class UserSessionService:
                 os.getenv('TELEGRAM_SESSION_PATH', '/data/telegram-session'), api_id, api_hash,
                 proxy=upstream.parse_proxy(proxy) if proxy else None,
                 flood_sleep_threshold=0,
+                # The durable worker owns retries. Telethon must surface loss
+                # after dispatch instead of reconnecting and replaying an RPC.
+                auto_reconnect=False,
+                request_retries=0,
+                connection_retries=0,
+                raise_last_call_error=True,
             )
             await self._client.connect()
             if not self._client.is_connected():

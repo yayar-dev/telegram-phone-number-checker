@@ -133,8 +133,79 @@ def test_one_authorized_client_serves_two_import_batches_and_cleanup(services):
     assert len(client.threads) == 1
     assert factory.arguments[0][0][0] == '/data/telegram-session'
     assert factory.arguments[0][1]['flood_sleep_threshold'] == 0
+    assert factory.arguments[0][1]['auto_reconnect'] is False
+    assert factory.arguments[0][1]['request_retries'] == 0
+    assert factory.arguments[0][1]['connection_retries'] == 0
     assert client.disconnect_calls == 0
     assert [type(request) for request in client.requests] == [ImportContactsRequest, ImportContactsRequest, DeleteContactsRequest]
+
+
+def test_real_telethon_sender_response_loss_is_quarantined_without_replay(services, tmp_path):
+    """Keep Telethon request/reconnect logic real; replace only network transport."""
+    from telethon import TelegramClient
+    from telethon.sessions import MemorySession
+    from telegram_phone_number_checker.queue_store import QueueStore
+    from telegram_phone_number_checker.validator_worker import ValidatorWorker
+
+    clients, dispatched, reconnects = [], [], []
+
+    class Transport:
+        async def disconnect(self):
+            pass
+
+    def factory(session, api_id, api_hash, **options):
+        # Fail promptly if defaults return, instead of contacting a real DC.
+        assert options['auto_reconnect'] is False
+        assert options['request_retries'] == 0
+        client = TelegramClient(MemorySession(), api_id, api_hash, **options)
+        clients.append(client)
+        sender = client._sender
+
+        async def connect():
+            sender._connection = Transport()
+            sender._user_connected = True
+
+        async def authorized():
+            return True
+
+        async def forbidden_reconnect():
+            reconnects.append(True)
+            raise ConnectionError('unexpected transport replay')
+
+        original_send = sender.send
+
+        async def dispatch_then_lose_response():
+            batch, _ = await sender._send_queue.get()
+            for state in batch:
+                dispatched.append(state.request)
+                sender._pending_state[state.msg_id] = state
+            sender._start_reconnect(ConnectionError('response lost after dispatch'))
+
+        def send(request, ordered=False):
+            future = original_send(request, ordered=ordered)
+            asyncio.create_task(dispatch_then_lose_response())
+            return future
+
+        client.connect = connect
+        client.is_user_authorized = authorized
+        sender._connect = forbidden_reconnect
+        sender.send = send
+        return client
+
+    service = services(factory)
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = store.create_job('+79990000001')
+    assert store.start(job_id)
+    worker = ValidatorWorker(store, service, 'worker')
+    assert worker.run_once()
+    assert store.rows(job_id)[0]['status'] == 'UNKNOWN_OUTCOME_REVIEW'
+    assert [attempt['outcome'] for attempt in store.item_attempts(job_id, store.rows(job_id)[0]['_item_id'])] == ['UNKNOWN_OUTCOME']
+    assert worker.run_once() is False
+    assert ValidatorWorker(QueueStore(store.path), service, 'restarted').run_once() is False
+    assert len(clients) == 1
+    assert [type(request) for request in dispatched] == [ImportContactsRequest]
+    assert reconnects == []
+    assert not clients[0].is_connected()
 
 
 def test_authorization_handoff_keeps_same_client_for_first_import(services):

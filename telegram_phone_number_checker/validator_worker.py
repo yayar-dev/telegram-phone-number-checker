@@ -33,7 +33,7 @@ class ValidatorWorker:
         self.sleep = sleep
         # Avoid a second request for a duplicate that appears in a later claimed
         # batch. The store also deduplicates durable work across restarts.
-        self._results_by_phone: dict[tuple[str, str], dict] = {}
+        self._results_by_phone: dict[tuple[str, str, str], dict] = {}
         self._import_batches_since_cleanup = 0
 
     def run_once(self) -> bool:
@@ -128,7 +128,7 @@ class ValidatorWorker:
         cached = [
             claim
             for claim in claims
-            if (claim["job_id"], claim["phone"]) in self._results_by_phone
+            if (claim["job_id"], claim["phone"], claim["method"]) in self._results_by_phone
         ]
         return cached, [claim for claim in claims if claim not in cached]
 
@@ -136,18 +136,19 @@ class ValidatorWorker:
         if source is not None:
             return {claim["phone"]: source[claim["phone"]] for claim in claims}
         return {
-            claim["phone"]: self._results_by_phone[(claim["job_id"], claim["phone"])]
+            claim["phone"]: self._results_by_phone[(claim["job_id"], claim["phone"], claim["method"])]
             for claim in claims
         }
 
     def _remember(self, claims: list[dict], results: dict[str, dict]) -> None:
         # Cache is filled by the claims that received a result, preserving job
-        # isolation while coalescing duplicate phones within one import batch.
+        # and method isolation while coalescing duplicate phones within one
+        # import batch. Legacy direct results cannot satisfy migrated imports.
         for phone, result in results.items():
             if not result.get("retry"):
                 for claim in claims:
                     if claim["phone"] == phone:
-                        self._results_by_phone[(claim["job_id"], phone)] = result
+                        self._results_by_phone[(claim["job_id"], phone, claim["method"])] = result
 
     def _finish(self, claims: list[dict], results: dict[str, dict]) -> None:
         finish_batch = getattr(self.store, "finish_batch", None)
