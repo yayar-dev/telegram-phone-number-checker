@@ -4,6 +4,7 @@ from threading import Thread
 import time
 from urllib.parse import urlencode
 import asyncio
+import logging
 import os
 import re
 import signal
@@ -34,6 +35,7 @@ def _wait_for_lifecycle(predicate, timeout=3):
 @pytest.mark.parametrize('password_error', [False, True])
 def test_browser_lifecycle_secrets_never_reach_database_csv_html_or_logs(tmp_path, monkeypatch, capfd, caplog, password_error):
     """Exercises real HTTP -> session handoff, including an error echoing secrets."""
+    caplog.set_level(logging.DEBUG)
     otp, password = '847296135', 'task5-2fa-S3cret-20261005'
     monkeypatch.setenv('API_ID', '1')
     monkeypatch.setenv('API_HASH', 'hash')
@@ -83,10 +85,29 @@ def test_browser_lifecycle_secrets_never_reach_database_csv_html_or_logs(tmp_pat
     captured = capfd.readouterr()
     outputs.extend([captured.out, captured.err, caplog.text])
     for output in outputs:
-        assert otp not in output
-        assert password not in output
+        assert otp not in output, 'OTP leaked into application output'
+        assert password not in output, '2FA password leaked into application output'
     assert otp.encode() not in (tmp_path / 'validator.db').read_bytes()
     assert password.encode() not in (tmp_path / 'validator.db').read_bytes()
+
+
+@pytest.mark.parametrize('credential', ['code', 'password'])
+def test_browser_lifecycle_secrecy_detects_info_credential_logs(tmp_path, monkeypatch, capfd, caplog, credential):
+    """A disposable client log must trip the real lifecycle secrecy assertion."""
+    original_sign_in = _TwoFactorAuthorizationClient.sign_in
+
+    async def sign_in_with_info_log(self, phone=None, code=None, password=None):
+        value = code if credential == 'code' else password
+        if value is not None:
+            logging.getLogger(__name__).info('Synthetic credential: %s', value)
+        return await original_sign_in(self, phone=phone, code=code, password=password)
+
+    monkeypatch.setattr(_TwoFactorAuthorizationClient, 'sign_in', sign_in_with_info_log)
+    message = 'OTP leaked' if credential == 'code' else '2FA password leaked'
+    with pytest.raises(AssertionError, match=message):
+        test_browser_lifecycle_secrets_never_reach_database_csv_html_or_logs(
+            tmp_path, monkeypatch, capfd, caplog, password_error=False,
+        )
 
 
 def test_sigterm_lifecycle_exits_within_docker_grace_and_releases_active_import(tmp_path):
