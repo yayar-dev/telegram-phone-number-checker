@@ -141,9 +141,9 @@ class DurableValidatorApplication:
         application = self
 
         class RequestHandler(BaseHTTPRequestHandler):
-            def send_content(self, content: str, content_type: str = "text/html; charset=utf-8"):
+            def send_content(self, content: str, content_type: str = "text/html; charset=utf-8", status: int = 200):
                 encoded = content.encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
@@ -210,6 +210,21 @@ class DurableValidatorApplication:
                     self.send_error(404)
                     return
                 job_id, action = parts
+                review_actions = {
+                    'requeue-legacy-direct': application.store.requeue_legacy_direct_rows,
+                    'requeue-unknown-outcomes': application.store.requeue_unknown_outcomes,
+                }
+                if action in review_actions:
+                    try:
+                        review_actions[action](job_id)
+                    except KeyError:
+                        self.send_error(404)
+                    except ValueError as error:
+                        self.send_content(_render_page(job=application.snapshot(job_id), error=str(error),
+                                                       authorization=application.authorization.snapshot()), status=409)
+                    else:
+                        self.redirect(f'/jobs/{job_id}')
+                    return
                 actions = {"start": application.start, "pause": application.pause, "resume": application.start, "cancel": application.cancel}
                 if action in actions and actions[action](job_id):
                     self.redirect(f"/jobs/{job_id}")
@@ -264,6 +279,20 @@ def _render_page(
                 + _action_form(job["id"], "cancel", "Отменить обработку", secondary=True)
             )
             refresh_html = '<meta http-equiv="refresh" content="2">'
+        legacy_count = job.get('legacy_direct_count', 0)
+        unknown_count = job.get('counts', {}).get('UNKNOWN_OUTCOME_REVIEW', 0)
+        if legacy_count or unknown_count or (state == 'PAUSED' and job.get('active_claims', 0)):
+            reason = job.get('requeue_block_reason', '')
+            if reason:
+                controls += f'<p class="hint">{html.escape(reason)}</p>'
+            else:
+                if legacy_count:
+                    controls += _action_form(job['id'], 'requeue-legacy-direct', 'Вернуть старые прямые проверки в очередь импорта', secondary=True)
+                if unknown_count:
+                    controls += (
+                        '<p class="hint">Результат предыдущего запроса неизвестен. Повтор может снова отправить запрос Telegram.</p>'
+                        + _action_form(job['id'], 'requeue-unknown-outcomes', 'Разрешить повтор проверок с неизвестным результатом', secondary=True)
+                    )
         waiting = ""
         if job.get("waiting_until"):
             remaining = max(0, round(job["waiting_until"] - time.time()))

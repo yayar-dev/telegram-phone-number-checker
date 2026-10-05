@@ -27,6 +27,11 @@ TERMINAL_STATUSES = {
     "CANCELLED",
 }
 
+LEGACY_DIRECT_REQUEUE_FILTER = """method = 'DIRECT_LOOKUP'
+    AND status IN ('PENDING', 'RETRYABLE_ERROR', 'UNRESOLVABLE_OR_PRIVACY')
+    AND manual_confirmation != 'MANUAL_CHAT_CONFIRMED'
+    AND api_status NOT IN ('FOUND', 'FOUND_NO_USERNAME')"""
+
 
 class QueueStore:
     """SQLite-backed queue; every public mutation is a short transaction."""
@@ -149,6 +154,81 @@ class QueueStore:
                VALUES (?, ?, ?, ?, ?, ?)""",
             (item_id, self.now(), method, outcome, detail, source),
         )
+
+    def item_attempts(self, job_id: str, item_id: str) -> list[dict]:
+        """Read append-only evidence only for an item belonging to this job."""
+        try:
+            parsed_item_id = int(item_id)
+        except (TypeError, ValueError):
+            return []
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute(
+                """SELECT a.* FROM job_item_attempts a JOIN job_items i ON i.id = a.item_id
+                   WHERE i.job_id = ? AND i.id = ? ORDER BY a.id""",
+                (job_id, parsed_item_id),
+            )]
+
+    @staticmethod
+    def _active_claim_count(connection: sqlite3.Connection, job_id: str) -> int:
+        # Even an expired or unleased IN_PROGRESS row requires recovery first.
+        return connection.execute(
+            """SELECT (SELECT COUNT(*) FROM job_items WHERE job_id = ? AND status = 'IN_PROGRESS')
+                 + (SELECT COUNT(*) FROM contact_cleanup WHERE job_id = ? AND state = 'IN_PROGRESS')""",
+            (job_id, job_id),
+        ).fetchone()[0]
+
+    @staticmethod
+    def _requeue_block_reason(state: str, active_claims: int) -> str:
+        if state != 'PAUSED':
+            return 'Возврат в очередь доступен только для задачи в состоянии PAUSED.'
+        if active_claims:
+            return f'Активные запросы Telegram: {active_claims}. Дождитесь завершения перед возвратом в очередь.'
+        return ''
+
+    def requeue_legacy_direct_rows(self, job_id: str) -> int:
+        """Explicitly migrate unconfirmed legacy direct rows without resuming."""
+        return self._requeue_review_rows(job_id, unknown_outcomes=False)
+
+    def requeue_unknown_outcomes(self, job_id: str) -> int:
+        """Operator-approved item retries; unknown cleanup records stay untouched."""
+        return self._requeue_review_rows(job_id, unknown_outcomes=True)
+
+    def _requeue_review_rows(self, job_id: str, *, unknown_outcomes: bool) -> int:
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            job = connection.execute('SELECT state FROM jobs WHERE id = ?', (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            reason = self._requeue_block_reason(job['state'], self._active_claim_count(connection, job_id))
+            if reason:
+                raise ValueError(reason)
+            row_filter = "status = 'UNKNOWN_OUTCOME_REVIEW'" if unknown_outcomes else LEGACY_DIRECT_REQUEUE_FILTER
+            rows = connection.execute(
+                'SELECT * FROM job_items WHERE job_id = ? AND ' + row_filter + ' ORDER BY id', (job_id,),
+            ).fetchall()
+            timestamp = self.now()
+            detail = (
+                'Оператор разрешил повтор запроса с неизвестным результатом через импорт.'
+                if unknown_outcomes else 'Старая прямая проверка возвращена в очередь импорта.'
+            )
+            for row in rows:
+                self.record_item_attempt(
+                    row['id'], row['method'], 'UNKNOWN_OUTCOME_REQUEUED' if unknown_outcomes else row['status'],
+                    detail, 'OPERATOR' if unknown_outcomes else 'LEGACY_DIRECT_MIGRATION', connection=connection,
+                )
+                connection.execute(
+                    """UPDATE job_items SET status = 'PENDING_RETRY', method = 'IMPORT',
+                       api_status = CASE WHEN api_status = '' THEN ? ELSE api_status END,
+                       detail = ?, next_attempt_at = ?, completed_at = NULL,
+                       lease_owner = NULL, lease_expires_at = NULL WHERE id = ?""",
+                    ('UNKNOWN_OUTCOME' if unknown_outcomes else row['status'], detail, timestamp + 60, row['id']),
+                )
+            message = f'Возвращено в очередь импорта: {len(rows)}. Обработка остаётся приостановленной.'
+            connection.execute('UPDATE jobs SET phase = ?, message = ?, updated_at = ? WHERE id = ?',
+                               ('IMPORT', message, timestamp, job_id))
+            self._event(connection, job_id, 'UNKNOWN_OUTCOMES_REQUEUED' if unknown_outcomes else 'LEGACY_DIRECT_REQUEUED', message)
+            connection.commit()
+            return len(rows)
 
     @staticmethod
     def _release_account(connection: sqlite3.Connection, claim: dict) -> None:
@@ -421,6 +501,10 @@ class QueueStore:
             counts = connection.execute(
                 "SELECT status, COUNT(*) AS count FROM job_items WHERE job_id = ? GROUP BY status", (job_id,)
             ).fetchall()
+            active_claims = self._active_claim_count(connection, job_id)
+            legacy_direct_count = connection.execute(
+                'SELECT COUNT(*) FROM job_items WHERE job_id = ? AND ' + LEGACY_DIRECT_REQUEUE_FILTER, (job_id,),
+            ).fetchone()[0]
         by_status = {row["status"]: row["count"] for row in counts}
         processed = sum(by_status.get(status, 0) for status in TERMINAL_STATUSES)
         confirmed = by_status.get("FOUND", 0) + by_status.get("FOUND_NO_USERNAME", 0)
@@ -446,6 +530,8 @@ class QueueStore:
                 ).fetchone()[0]
         return {
             **dict(job), "total": job["total_rows"], "processed": processed,
+            "active_claims": active_claims, "legacy_direct_count": legacy_direct_count,
+            "requeue_block_reason": self._requeue_block_reason(job['state'], active_claims),
             "confirmed": confirmed, "counts": by_status, "phase_remaining": phase_remaining,
             "phase_total": phase_total, "phase_processed": phase_total - phase_remaining,
             "items_per_minute": round(processed / max(timestamp - started_at, 0.001) * 60, 1) if started_at and processed else None,

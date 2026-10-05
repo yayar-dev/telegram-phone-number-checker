@@ -1251,3 +1251,105 @@ def test_web_main_sigterm_shutdown_runs_on_helper_thread_and_closes_application(
     monkeypatch.setenv('TELEGRAM_VALIDATOR_DATA_DIR', str(tmp_path))
     web.main()
     assert events == ['serve', 'shutdown', 'serve-stopped', 'server-close', 'app-close']
+
+
+@pytest.fixture
+def review_web_app(tmp_path, monkeypatch):
+    # All review scenarios use a temporary database and perform no Telegram IO.
+    monkeypatch.setattr(DurableValidatorApplication, '_run_worker', lambda self: self._stop.wait())
+    app = DurableValidatorApplication(tmp_path / 'validator.db', gateway=_BlockingGateway(), authorization=_AuthorizedAuthorization())
+    job_id = app.enqueue('+79990000000\n+79991111111\n+79992222222')
+    app.store.start(job_id)
+    app.store.pause(job_id)
+    with app.store._connect() as connection:
+        connection.execute("UPDATE job_items SET method='DIRECT_LOOKUP', status='UNRESOLVABLE_OR_PRIVACY', api_status='UNRESOLVABLE_OR_PRIVACY' WHERE job_id=? AND ordinal=0", (job_id,))
+        connection.execute("UPDATE job_items SET status='UNKNOWN_OUTCOME_REVIEW', api_status='UNKNOWN_OUTCOME' WHERE job_id=? AND ordinal=1", (job_id,))
+        connection.execute("UPDATE job_items SET status='FOUND', api_status='FOUND', username='known_user', telegram_link='https://t.me/known_user' WHERE job_id=? AND ordinal=2", (job_id,))
+    yield app, job_id
+    app.close()
+
+
+def test_paused_job_page_exposes_legacy_direct_and_unknown_outcome_review_actions(review_web_app):
+    app, job_id = review_web_app
+    page = app.render_job_page(job_id)
+    assert f'action="/jobs/{job_id}/requeue-legacy-direct"' in page
+    assert 'Вернуть старые прямые проверки в очередь импорта' in page
+    assert f'action="/jobs/{job_id}/requeue-unknown-outcomes"' in page
+    assert 'UNKNOWN_OUTCOME_REVIEW' in page
+    assert 'Результат предыдущего запроса неизвестен' in page
+    assert 'https://t.me/+79990000000?profile' in page
+
+
+@pytest.mark.parametrize('blocked_by', ['RUNNING', 'item', 'cleanup'])
+def test_legacy_direct_review_page_hides_actions_and_gives_exact_block_reason(review_web_app, blocked_by):
+    app, job_id = review_web_app
+    with app.store._connect() as connection:
+        if blocked_by == 'RUNNING':
+            connection.execute("UPDATE jobs SET state='RUNNING' WHERE id=?", (job_id,))
+        elif blocked_by == 'item':
+            connection.execute("UPDATE job_items SET status='IN_PROGRESS' WHERE job_id=? AND ordinal=2", (job_id,))
+        else:
+            connection.execute("INSERT INTO contact_cleanup(job_id, telegram_user_id, state, created_at) VALUES (?, 123, 'IN_PROGRESS', 999)", (job_id,))
+    page = app.render_job_page(job_id)
+    assert f'action="/jobs/{job_id}/requeue-legacy-direct"' not in page
+    assert f'action="/jobs/{job_id}/requeue-unknown-outcomes"' not in page
+    assert ('PAUSED' if blocked_by == 'RUNNING' else 'Активные запросы Telegram: 1') in page
+
+
+@pytest.mark.parametrize('action', ['requeue-legacy-direct', 'requeue-unknown-outcomes'])
+@pytest.mark.parametrize('blocked_by', [None, 'RUNNING', 'item', 'cleanup'])
+def test_legacy_direct_and_unknown_review_http_actions_are_explicit_and_atomic(review_web_app, action, blocked_by):
+    app, job_id = review_web_app
+    with app.store._connect() as connection:
+        if blocked_by == 'RUNNING':
+            connection.execute("UPDATE jobs SET state='RUNNING' WHERE id=?", (job_id,))
+        elif blocked_by == 'item':
+            connection.execute("UPDATE job_items SET status='IN_PROGRESS' WHERE job_id=? AND ordinal=2", (job_id,))
+        elif blocked_by == 'cleanup':
+            connection.execute("INSERT INTO contact_cleanup(job_id, telegram_user_id, state, created_at) VALUES (?, 123, 'IN_PROGRESS', 999)", (job_id,))
+    before = app.store.rows(job_id)
+    server = create_durable_server(app, port=0)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection('127.0.0.1', server.server_port)
+    try:
+        connection.request('POST', f'/jobs/{job_id}/{action}')
+        response = connection.getresponse()
+        body = response.read().decode()
+        if blocked_by:
+            assert response.status == 409
+            assert ('PAUSED' if blocked_by == 'RUNNING' else 'Активные запросы Telegram: 1') in body
+            assert app.store.rows(job_id) == before
+        else:
+            assert response.status == 303
+            assert response.getheader('Location') == f'/jobs/{job_id}'
+            connection.request('GET', f'/jobs/{job_id}')
+            response = connection.getresponse()
+            page = response.read().decode()
+            assert 'Возвращено в очередь импорта: 1.' in page
+            assert app.store.snapshot(job_id)['state'] == 'PAUSED'
+            rows = app.store.rows(job_id)
+            changed_index = 0 if action == 'requeue-legacy-direct' else 1
+            assert rows[changed_index]['status'] == 'PENDING_RETRY'
+            assert rows[2] == before[2]
+            connection.request('GET', f'/download.csv?job={job_id}')
+            response = connection.getresponse()
+            csv = response.read().decode()
+            assert response.status == 200
+            assert 'PENDING_RETRY' in csv and 'https://t.me/known_user' in csv
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_paused_review_page_explains_active_claim_even_without_remaining_review_rows(review_web_app):
+    app, job_id = review_web_app
+    with app.store._connect() as connection:
+        connection.execute("UPDATE job_items SET status='IN_PROGRESS' WHERE job_id=? AND ordinal=0", (job_id,))
+        connection.execute("UPDATE job_items SET status='FOUND', api_status='FOUND' WHERE job_id=? AND ordinal=1", (job_id,))
+    page = app.render_job_page(job_id)
+    assert 'Активные запросы Telegram: 1. Дождитесь завершения перед возвратом в очередь.' in page
+    assert f'action="/jobs/{job_id}/requeue-legacy-direct"' not in page
+    assert f'action="/jobs/{job_id}/requeue-unknown-outcomes"' not in page

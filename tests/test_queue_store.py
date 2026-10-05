@@ -476,3 +476,148 @@ def test_repeated_import_response_commit_does_not_double_count_batch(tmp_path):
     with store._connect() as connection:
         assert connection.execute('SELECT import_batches_since_cleanup FROM worker_state').fetchone()[0] == 1
         assert connection.execute('SELECT COUNT(*) FROM job_item_attempts').fetchone()[0] == 1
+
+
+def _legacy_review_job(store):
+    job_id = store.create_job('\n'.join(f'+7999000000{i}' for i in range(8)))
+    store.start(job_id)
+    store.pause(job_id)
+    with store._connect() as connection:
+        for ordinal, status, method, api_status, manual in [
+            (0, 'PENDING', 'DIRECT_LOOKUP', '', 'NOT_CONFIRMED'),
+            (1, 'RETRYABLE_ERROR', 'DIRECT_LOOKUP', 'RETRYABLE_ERROR', 'NOT_CONFIRMED'),
+            (2, 'UNRESOLVABLE_OR_PRIVACY', 'DIRECT_LOOKUP', 'UNRESOLVABLE_OR_PRIVACY', 'NOT_CONFIRMED'),
+            (3, 'UNRESOLVABLE_OR_PRIVACY', 'DIRECT_LOOKUP', 'UNRESOLVABLE_OR_PRIVACY', 'MANUAL_CHAT_CONFIRMED'),
+            (4, 'FOUND', 'DIRECT_LOOKUP', 'FOUND', 'NOT_CONFIRMED'),
+            (5, 'PENDING', 'DIRECT_LOOKUP', 'FOUND_NO_USERNAME', 'NOT_CONFIRMED'),
+            (6, 'UNRESOLVABLE_OR_PRIVACY', 'IMPORT', 'UNRESOLVABLE_OR_PRIVACY', 'NOT_CONFIRMED'),
+            (7, 'UNKNOWN_OUTCOME_REVIEW', 'IMPORT', 'UNKNOWN_OUTCOME', 'NOT_CONFIRMED'),
+        ]:
+            connection.execute('UPDATE job_items SET status=?, method=?, api_status=?, manual_confirmation=?, detail=? WHERE job_id=? AND ordinal=?',
+                               (status, method, api_status, manual, 'legacy raw details +79990000000 secret', job_id, ordinal))
+    return job_id
+
+
+def test_legacy_direct_migration_requeues_only_unconfirmed_rows_with_safe_history(tmp_path):
+    clock = Clock()
+    store = QueueStore(tmp_path / 'validator.db', now=clock)
+    job_id = _legacy_review_job(store)
+    before = store.rows(job_id)
+    store.record_item_attempt(int(before[2]['_item_id']), 'DIRECT_LOOKUP', 'UNRESOLVABLE_OR_PRIVACY', 'safe previous evidence')
+
+    assert store.requeue_legacy_direct_rows(job_id) == 3
+
+    rows = store.rows(job_id)
+    assert [row['status'] for row in rows[:3]] == ['PENDING_RETRY'] * 3
+    assert [row['method'] for row in rows[:3]] == ['IMPORT'] * 3
+    assert [row['next_attempt_at'] for row in rows[:3]] == [1060.0] * 3
+    assert [row['api_status'] for row in rows[:3]] == ['PENDING', 'RETRYABLE_ERROR', 'UNRESOLVABLE_OR_PRIVACY']
+    assert rows[3:] == before[3:]
+    assert store.snapshot(job_id)['state'] == 'PAUSED'
+    assert store.claim_next('worker') is None
+    history = store.item_attempts(job_id, rows[2]['_item_id'])
+    assert history[0]['detail'] == 'safe previous evidence'
+    assert history[-1]['outcome'] == 'UNRESOLVABLE_OR_PRIVACY'
+    assert history[-1]['method'] == 'DIRECT_LOOKUP'
+    assert history[-1]['source'] == 'LEGACY_DIRECT_MIGRATION'
+    assert 'secret' not in str(history) and '+79990000000' not in str(history)
+    assert '3' in store.events(job_id)[-1]['message']
+    assert store.requeue_legacy_direct_rows(job_id) == 0
+    assert len(store.item_attempts(job_id, rows[2]['_item_id'])) == 2
+
+
+def test_item_attempts_is_scoped_ordered_and_survives_reopen(tmp_path):
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = store.create_job('+79990000000')
+    other_id = store.create_job('+79991111111')
+    item_id = store.rows(job_id)[0]['_item_id']
+    store.record_item_attempt(int(item_id), 'IMPORT', 'UNKNOWN_OUTCOME', 'unknown')
+    store.record_item_attempt(int(item_id), 'IMPORT', 'REVIEW_NOTE', 'reviewed', 'OPERATOR')
+    reopened = QueueStore(store.path)
+    assert [attempt['outcome'] for attempt in reopened.item_attempts(job_id, item_id)] == ['UNKNOWN_OUTCOME', 'REVIEW_NOTE']
+    assert reopened.item_attempts(other_id, item_id) == []
+    assert reopened.item_attempts(job_id, 'not-an-id') == []
+
+
+def test_requeue_unknown_outcomes_preserves_evidence_and_unknown_cleanup(tmp_path):
+    store = QueueStore(tmp_path / 'validator.db', now=Clock())
+    job_id = _legacy_review_job(store)
+    before = store.rows(job_id)
+    item_id = before[7]['_item_id']
+    store.record_item_attempt(int(item_id), 'IMPORT', 'UNKNOWN_OUTCOME', 'unknown evidence')
+    with store._connect() as connection:
+        connection.execute("INSERT INTO contact_cleanup(job_id, telegram_user_id, item_id, state, created_at, last_error) VALUES (?, 123, ?, 'UNKNOWN_OUTCOME_REVIEW', 999, 'unknown cleanup')", (job_id, int(item_id)))
+        cleanup_before = dict(connection.execute('SELECT * FROM contact_cleanup').fetchone())
+
+    assert store.requeue_unknown_outcomes(job_id) == 1
+
+    rows = store.rows(job_id)
+    assert rows[:7] == before[:7]
+    assert rows[7]['status'] == 'PENDING_RETRY'
+    assert rows[7]['method'] == 'IMPORT'
+    assert rows[7]['api_status'] == 'UNKNOWN_OUTCOME'
+    assert rows[7]['next_attempt_at'] == 1060.0
+    history = store.item_attempts(job_id, item_id)
+    assert history[0]['outcome'] == 'UNKNOWN_OUTCOME'
+    assert history[0]['detail'] == 'unknown evidence'
+    assert history[-1]['outcome'] == 'UNKNOWN_OUTCOME_REQUEUED'
+    assert history[-1]['source'] == 'OPERATOR'
+    assert store.snapshot(job_id)['state'] == 'PAUSED'
+    assert store.requeue_unknown_outcomes(job_id) == 0
+    with store._connect() as connection:
+        assert dict(connection.execute('SELECT * FROM contact_cleanup').fetchone()) == cleanup_before
+
+
+@pytest.mark.parametrize('action', ['requeue_legacy_direct_rows', 'requeue_unknown_outcomes'])
+@pytest.mark.parametrize('blocked_by', ['RUNNING', 'item', 'cleanup'])
+def test_requeue_legacy_direct_and_unknown_actions_reject_unpaused_or_active_claims(tmp_path, action, blocked_by):
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = _legacy_review_job(store)
+    with store._connect() as connection:
+        if blocked_by == 'RUNNING':
+            connection.execute("UPDATE jobs SET state='RUNNING' WHERE id=?", (job_id,))
+        elif blocked_by == 'item':
+            connection.execute("UPDATE job_items SET status='IN_PROGRESS', lease_owner='worker' WHERE job_id=? AND ordinal=6", (job_id,))
+        else:
+            connection.execute("INSERT INTO contact_cleanup(job_id, telegram_user_id, state, created_at, lease_owner) VALUES (?, 123, 'IN_PROGRESS', 999, 'worker')", (job_id,))
+    before = store.rows(job_id)
+    events = store.events(job_id)
+    with pytest.raises(ValueError, match='PAUSED' if blocked_by == 'RUNNING' else 'Активные запросы Telegram: 1'):
+        getattr(store, action)(job_id)
+    assert store.rows(job_id) == before
+    assert store.events(job_id) == events
+    with store._connect() as connection:
+        assert connection.execute('SELECT COUNT(*) FROM job_item_attempts').fetchone()[0] == 0
+
+
+def test_legacy_direct_migration_keeps_only_confirmed_rows_unchanged(tmp_path):
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = _legacy_review_job(store)
+    with store._connect() as connection:
+        connection.execute('DELETE FROM job_items WHERE job_id=? AND ordinal NOT IN (3, 4, 5)', (job_id,))
+    before = store.rows(job_id)
+    assert store.requeue_legacy_direct_rows(job_id) == 0
+    assert store.rows(job_id) == before
+    with store._connect() as connection:
+        assert connection.execute('SELECT COUNT(*) FROM job_item_attempts').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('action', ['requeue_legacy_direct_rows', 'requeue_unknown_outcomes'])
+def test_review_requeue_rolls_back_rows_and_evidence_on_audit_failure(tmp_path, monkeypatch, action):
+    store = QueueStore(tmp_path / 'validator.db')
+    job_id = _legacy_review_job(store)
+    before = store.rows(job_id)
+    events = store.events(job_id)
+    record_attempt = store.record_item_attempt
+
+    def record_then_fail(*args, **kwargs):
+        record_attempt(*args, **kwargs)
+        raise RuntimeError('audit storage failure')
+
+    monkeypatch.setattr(store, 'record_item_attempt', record_then_fail)
+    with pytest.raises(RuntimeError, match='audit storage failure'):
+        getattr(store, action)(job_id)
+    assert store.rows(job_id) == before
+    assert store.events(job_id) == events
+    with store._connect() as connection:
+        assert connection.execute('SELECT COUNT(*) FROM job_item_attempts').fetchone()[0] == 0
