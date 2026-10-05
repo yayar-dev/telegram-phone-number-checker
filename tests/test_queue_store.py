@@ -13,6 +13,60 @@ class Clock:
         return self.value
 
 
+def test_result_summary_separates_api_confirmation_from_privacy_and_retry(tmp_path):
+    store = QueueStore(tmp_path / 'validator.db', now=Clock())
+    job_id = store.create_job('\n'.join(f'+799900000{i:02d}' for i in range(15)))
+    statuses = ['FOUND', 'FOUND_NO_USERNAME'] + ['PENDING_RETRY'] * 3 + ['UNRESOLVABLE_OR_PRIVACY'] * 4 + ['PENDING'] * 5 + ['UNKNOWN_OUTCOME_REVIEW']
+    with store._connect() as connection:
+        for ordinal, status in enumerate(statuses):
+            connection.execute('UPDATE job_items SET status=? WHERE job_id=? AND ordinal=?', (status, job_id, ordinal))
+    assert store.result_summary(job_id) == {
+        'api_confirmed': 2, 'pending_retry': 3, 'privacy_ambiguous': 4,
+        'pending_import': 5, 'waiting_authorization': 0, 'unknown_outcome_review': 1,
+    }
+
+
+def test_result_summary_counts_unfinished_authorization_wait_rows(tmp_path):
+    store = QueueStore(tmp_path / 'validator.db', now=Clock())
+    job_id = store.create_job('+79990000000\n+79991111111')
+    with store._connect() as connection:
+        connection.execute("UPDATE job_items SET status='FOUND' WHERE job_id=? AND ordinal=0", (job_id,))
+        connection.execute("UPDATE jobs SET state='WAITING_AUTHORIZATION' WHERE id=?", (job_id,))
+    summary = store.result_summary(job_id)
+    assert summary['api_confirmed'] == 1
+    assert summary['waiting_authorization'] == 1
+    assert summary['pending_import'] == 1
+
+
+def test_authorization_resume_requires_explicit_application_confirmation(tmp_path):
+    store = QueueStore(tmp_path / 'validator.db', now=Clock())
+    job_id = store.create_job('+79990000000')
+    with store._connect() as connection:
+        connection.execute("UPDATE jobs SET state='WAITING_AUTHORIZATION' WHERE id=?", (job_id,))
+    assert store.start(job_id) is False
+    assert store.snapshot(job_id)['state'] == 'WAITING_AUTHORIZATION'
+    assert store.start(job_id, authorization_confirmed=True) is True
+    assert store.start(job_id, authorization_confirmed=True) is False
+
+
+@pytest.mark.parametrize('obstacle', ['PENDING_RETRY', 'RETRYABLE_ERROR', 'UNKNOWN_OUTCOME_REVIEW', 'WAITING_AUTHORIZATION', 'WAITING_RATE_LIMIT', 'floodwait', 'unknown_cleanup'])
+def test_result_summary_suppresses_eta_for_unresolved_waits(tmp_path, obstacle):
+    store = QueueStore(tmp_path / 'validator.db', now=Clock(1100))
+    job_id = store.create_job('+79990000000\n+79991111111')
+    with store._connect() as connection:
+        connection.execute("UPDATE jobs SET state='RUNNING', started_at=1000 WHERE id=?", (job_id,))
+        connection.execute("UPDATE job_items SET status='FOUND' WHERE job_id=? AND ordinal=0", (job_id,))
+        if obstacle.startswith('WAITING_'):
+            connection.execute('UPDATE jobs SET state=? WHERE id=?', (obstacle, job_id))
+        elif obstacle == 'floodwait':
+            connection.execute('UPDATE jobs SET resume_after=1200 WHERE id=?', (job_id,))
+        elif obstacle == 'unknown_cleanup':
+            connection.execute("INSERT INTO contact_cleanup(job_id, telegram_user_id, state, created_at) VALUES (?, 123, 'UNKNOWN_OUTCOME_REVIEW', 1000)", (job_id,))
+        else:
+            connection.execute('UPDATE job_items SET status=? WHERE job_id=? AND ordinal=1', (obstacle, job_id))
+    assert store.snapshot(job_id)['eta_seconds'] is None
+
+
 def test_store_creates_every_input_ordinal_and_restores_it(tmp_path):
     database = tmp_path / "validator.db"
     store = QueueStore(database)

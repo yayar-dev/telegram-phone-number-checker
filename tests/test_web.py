@@ -1353,3 +1353,46 @@ def test_paused_review_page_explains_active_claim_even_without_remaining_review_
     assert 'Активные запросы Telegram: 1. Дождитесь завершения перед возвратом в очередь.' in page
     assert f'action="/jobs/{job_id}/requeue-legacy-direct"' not in page
     assert f'action="/jobs/{job_id}/requeue-unknown-outcomes"' not in page
+
+
+def test_privacy_ambiguity_page_separates_outcomes_and_explains_retry(review_web_app):
+    app, job_id = review_web_app
+    with app.store._connect() as connection:
+        connection.execute("UPDATE job_items SET status='PENDING_RETRY', method='IMPORT', next_attempt_at=?, detail='Telegram отложил импорт; номер сохранён для повторного импорта.' WHERE job_id=? AND ordinal=1", (time.time() + 300, job_id))
+    page = app.render_job_page(job_id)
+    assert 'Подтверждено API: 1' in page
+    assert 'API не определил из-за приватности: 1' in page
+    assert 'Повторный импорт ожидают: 1' in page
+    assert 'Требуется повторная авторизация: 0' in page
+    assert 'не доказывает отсутствие аккаунта' in page
+    assert 'Следующая попытка импорта через' in page
+    assert 'Telegram отложил импорт' in page
+    assert 'Оценка до завершения' not in page
+
+
+def test_authorization_wait_page_requires_explicit_resume_after_browser_login(review_web_app):
+    app, job_id = review_web_app
+    class Authorization(_CodeSentAuthorization):
+        state = 'CODE_SENT'
+        def snapshot(self):
+            return {'state': self.state, 'message': 'Введите код Telegram.'}
+        def submit_code(self, code):
+            self.state = 'AUTHORIZED'
+            return True
+    app.authorization = Authorization()
+    with app.store._connect() as connection:
+        connection.execute("UPDATE jobs SET state='WAITING_AUTHORIZATION' WHERE id=?", (job_id,))
+    page = app.render_job_page(job_id)
+    assert 'Требуется повторная авторизация: 1' in page
+    assert 'Возобновить после авторизации' in page
+    assert f'action="/jobs/{job_id}/resume"' not in page
+    assert app.start(job_id) is False
+    assert app.submit_authorization_code('12345') is True
+    assert app.store.snapshot(job_id)['state'] == 'WAITING_AUTHORIZATION'
+    assert app.store.claim_next('other-worker') is None
+    page = app.render_job_page(job_id)
+    assert f'action="/jobs/{job_id}/resume"' in page
+    assert 'Возобновить после авторизации' in page
+    assert app.start(job_id) is True
+    assert app.start(job_id) is False
+    assert sum(event['kind'] == 'STARTED' for event in app.store.events(job_id)) == 2

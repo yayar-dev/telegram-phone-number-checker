@@ -114,7 +114,7 @@ class DurableValidatorApplication:
         return (
             not self.startup_error
             and self.authorization.snapshot()["state"] == "AUTHORIZED"
-            and self.store.start(job_id)
+            and self.store.start(job_id, authorization_confirmed=True)
         )
 
     def pause(self, job_id: str) -> bool:
@@ -273,6 +273,12 @@ def _render_page(
                 _action_form(job["id"], "resume", "Возобновить обработку")
                 + _action_form(job["id"], "cancel", "Отменить обработку", secondary=True)
             )
+        elif state == 'WAITING_AUTHORIZATION':
+            controls = (
+                _action_form(job['id'], 'resume', 'Возобновить после авторизации')
+                if authorization['state'] == 'AUTHORIZED'
+                else '<p class="hint">Возобновить после авторизации: сначала подключите Telegram.</p>'
+            )
         elif state in {"QUEUED", "RUNNING", "WAITING_RATE_LIMIT"}:
             controls = (
                 _action_form(job["id"], "pause", "Приостановить")
@@ -300,6 +306,23 @@ def _render_page(
                 f"<p>Ожидание Telegram: следующая попытка через {remaining // 60} мин. "
                 f"{remaining % 60} сек.</p>"
             )
+        retry_times = [row['next_attempt_at'] for row in job['rows']
+                       if row['status'] in {'PENDING_RETRY', 'RETRYABLE_ERROR'} and row.get('next_attempt_at') is not None]
+        if retry_times:
+            remaining = max(0, round(min(retry_times) - time.time()))
+            waiting += f'<p>Следующая попытка импорта через {remaining // 60} мин. {remaining % 60} сек.; запуск зависит от состояния задачи и лимита Telegram.</p>'
+        summary_labels = {
+            'api_confirmed': 'Подтверждено API',
+            'privacy_ambiguous': 'API не определил из-за приватности',
+            'pending_retry': 'Повторный импорт ожидают',
+            'pending_import': 'Ожидают импорта',
+            'waiting_authorization': 'Требуется повторная авторизация',
+            'unknown_outcome_review': 'Неизвестный результат — требуется решение оператора',
+        }
+        summary_html = ''.join(
+            f'<li>{label}: {job.get("result_summary", {}).get(key, 0)}</li>'
+            for key, label in summary_labels.items()
+        )
         phase_labels = {
             "IMPORT": "импорт контактов",
             "DIRECT_LOOKUP": "прямая проверка",
@@ -318,7 +341,8 @@ def _render_page(
             speed = f"<p>Скорость: {job['items_per_minute']} ном./мин.</p>"
         job_html = (
             f"<p>Обработано номеров: {processed} из {total}.</p>"
-            f"<p>Найдено аккаунтов: {job.get('confirmed', 0)}.</p>"
+            f'<ul>{summary_html}</ul>'
+            '<p class="hint">API может не раскрыть номер из-за приватности; это не доказывает отсутствие аккаунта. Ручное подтверждение чата учитывается отдельно от ответа API.</p>'
             f"<p>Этап: {html.escape(phase_labels.get(job.get('phase', ''), job.get('phase', 'ожидание')))}; "
             f"обработано в этапе: {job.get('phase_processed', 0)} из {job.get('phase_total', 0)}; "
             f"осталось: {job.get('phase_remaining', 0)}.</p>"

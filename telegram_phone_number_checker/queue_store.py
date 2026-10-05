@@ -493,6 +493,28 @@ class QueueStore:
                 "SELECT * FROM job_events WHERE job_id = ? ORDER BY id", (job_id,)
             )]
 
+    def result_summary(self, job_id: str) -> dict[str, int]:
+        """Count current API outcomes and unresolved work, never infer absence."""
+        with self._connect() as connection:
+            job = connection.execute('SELECT state FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            return self._result_summary(connection, job_id, job['state'])
+
+    @staticmethod
+    def _result_summary(connection: sqlite3.Connection, job_id: str, state: str) -> dict[str, int]:
+        rows = connection.execute(
+            'SELECT status, method, COUNT(*) AS count FROM job_items WHERE job_id=? GROUP BY status, method', (job_id,),
+        ).fetchall()
+        return {
+            'api_confirmed': sum(row['count'] for row in rows if row['status'] in {'FOUND', 'FOUND_NO_USERNAME'}),
+            'pending_retry': sum(row['count'] for row in rows if row['status'] == 'PENDING_RETRY'),
+            'privacy_ambiguous': sum(row['count'] for row in rows if row['status'] == 'UNRESOLVABLE_OR_PRIVACY'),
+            'pending_import': sum(row['count'] for row in rows if row['method'] == 'IMPORT' and row['status'] in {'PENDING', 'RETRYABLE_ERROR', 'IN_PROGRESS'}),
+            'waiting_authorization': sum(row['count'] for row in rows if row['status'] not in TERMINAL_STATUSES) if state == 'WAITING_AUTHORIZATION' else 0,
+            'unknown_outcome_review': sum(row['count'] for row in rows if row['status'] == 'UNKNOWN_OUTCOME_REVIEW'),
+        }
+
     def snapshot(self, job_id: str) -> dict | None:
         with self._connect() as connection:
             job = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -505,13 +527,23 @@ class QueueStore:
             legacy_direct_count = connection.execute(
                 'SELECT COUNT(*) FROM job_items WHERE job_id = ? AND ' + LEGACY_DIRECT_REQUEUE_FILTER, (job_id,),
             ).fetchone()[0]
+            summary = self._result_summary(connection, job_id, job['state'])
+            cleanup_wait = connection.execute(
+                "SELECT COUNT(*) FROM contact_cleanup WHERE job_id=? AND (state='UNKNOWN_OUTCOME_REVIEW' OR (state='PENDING' AND attempts > 0))", (job_id,),
+            ).fetchone()[0]
         by_status = {row["status"]: row["count"] for row in counts}
         processed = sum(by_status.get(status, 0) for status in TERMINAL_STATUSES)
         confirmed = by_status.get("FOUND", 0) + by_status.get("FOUND_NO_USERNAME", 0)
         timestamp = self.now()
         started_at = job["started_at"]
         eta_seconds = None
-        if started_at and processed:
+        uncertain_wait = (
+            summary['pending_retry'] or summary['unknown_outcome_review']
+            or by_status.get('RETRYABLE_ERROR', 0) or cleanup_wait
+            or job['state'] in {'WAITING_AUTHORIZATION', 'WAITING_RATE_LIMIT'}
+            or (job['resume_after'] is not None and job['resume_after'] > timestamp)
+        )
+        if started_at and processed and not uncertain_wait:
             rate = processed / max(timestamp - started_at, 0.001)
             eta_seconds = max(0, round((job["total_rows"] - processed) / rate))
         phase = job["phase"]
@@ -533,6 +565,7 @@ class QueueStore:
             "active_claims": active_claims, "legacy_direct_count": legacy_direct_count,
             "requeue_block_reason": self._requeue_block_reason(job['state'], active_claims),
             "confirmed": confirmed, "counts": by_status, "phase_remaining": phase_remaining,
+            "result_summary": summary,
             "phase_total": phase_total, "phase_processed": phase_total - phase_remaining,
             "items_per_minute": round(processed / max(timestamp - started_at, 0.001) * 60, 1) if started_at and processed else None,
             "eta_seconds": eta_seconds,
@@ -1204,14 +1237,16 @@ class QueueStore:
             self._event(connection, job_id, "CANCELLED", "Проверка отменена пользователем.")
             connection.commit()
 
-    def start(self, job_id: str) -> bool:
+    def start(self, job_id: str, *, authorization_confirmed: bool = False) -> bool:
+        """Resume an authorization wait only after the application checked its session."""
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             changed = connection.execute(
                 """UPDATE jobs SET state = 'QUEUED', phase = 'IMPORT', message = 'Задача ожидает worker.',
                    started_at = COALESCE(started_at, ?), updated_at = ?
-                   WHERE id = ? AND state IN ('STAGED', 'PAUSED', 'WAITING_RATE_LIMIT', 'WAITING_AUTHORIZATION')""",
-                (self.now(), self.now(), job_id),
+                   WHERE id = ? AND (state IN ('STAGED', 'PAUSED', 'WAITING_RATE_LIMIT')
+                   OR (state = 'WAITING_AUTHORIZATION' AND ?))""",
+                (self.now(), self.now(), job_id, authorization_confirmed),
             ).rowcount
             if changed:
                 self._event(connection, job_id, "STARTED", "Запущена обработка задачи.")

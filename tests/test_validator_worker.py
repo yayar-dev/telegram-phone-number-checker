@@ -282,7 +282,8 @@ def test_revoked_session_pauses_job_without_incrementing_normal_retry_count(tmp_
     gateway = AuthorizedGateway()
     authorized_worker = ValidatorWorker(store, gateway, "test-worker")
     assert authorized_worker.run_once() is False
-    assert store.start(job_id) is True
+    # The application confirms its AUTHORIZED session before explicit resume.
+    assert store.start(job_id, authorization_confirmed=True) is True
     assert authorized_worker.run_once() is True
     assert gateway.calls == 1
 
