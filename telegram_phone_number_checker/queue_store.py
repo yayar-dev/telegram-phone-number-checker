@@ -516,6 +516,7 @@ class QueueStore:
         }
 
     def snapshot(self, job_id: str) -> dict | None:
+        timestamp = self.now()
         with self._connect() as connection:
             job = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if not job:
@@ -531,17 +532,41 @@ class QueueStore:
             cleanup_wait = connection.execute(
                 "SELECT COUNT(*) FROM contact_cleanup WHERE job_id=? AND (state='UNKNOWN_OUTCOME_REVIEW' OR (state='PENDING' AND attempts > 0))", (job_id,),
             ).fetchone()[0]
+            account = connection.execute(
+                "SELECT next_available_at FROM worker_state WHERE account_key='default'",
+            ).fetchone()
+            account_wait_until = account['next_available_at'] if account and account['next_available_at'] > timestamp else None
+            cleanup_rows = connection.execute(
+                """SELECT state, last_error, next_attempt_at, COUNT(*) AS count FROM contact_cleanup
+                   WHERE job_id=? AND (state='UNKNOWN_OUTCOME_REVIEW'
+                   OR (state='PENDING' AND (attempts > 0 OR last_error != '')))
+                   GROUP BY state, last_error, next_attempt_at ORDER BY next_attempt_at, state, last_error""", (job_id,),
+            ).fetchall()
+        safe_cleanup_reasons = {
+            'Ошибка запроса очистки Telegram; повтор запланирован.',
+            'Telegram ограничил очистку контактов.',
+            'Результат очистки неизвестен; требуется решение оператора.',
+            'После перезапуска результат отправленного запроса неизвестен; требуется решение оператора.',
+            'Требуется авторизация Telegram.',
+        }
+        cleanup_waits = [{
+            'state': row['state'], 'count': row['count'],
+            'reason': row['last_error'] if row['last_error'] in safe_cleanup_reasons else 'Очистка контактов ожидает повторной проверки оператором.',
+            'next_attempt_at': max(row['next_attempt_at'], account_wait_until or 0) if row['next_attempt_at'] is not None else None,
+        } for row in cleanup_rows]
+        wait_deadlines = [deadline for deadline in (job['resume_after'], account_wait_until)
+                          if deadline is not None and deadline > timestamp]
+        effective_wait_until = max(wait_deadlines) if wait_deadlines else None
         by_status = {row["status"]: row["count"] for row in counts}
         processed = sum(by_status.get(status, 0) for status in TERMINAL_STATUSES)
         confirmed = by_status.get("FOUND", 0) + by_status.get("FOUND_NO_USERNAME", 0)
-        timestamp = self.now()
         started_at = job["started_at"]
         eta_seconds = None
         uncertain_wait = (
             summary['pending_retry'] or summary['unknown_outcome_review']
             or by_status.get('RETRYABLE_ERROR', 0) or cleanup_wait
             or job['state'] in {'WAITING_AUTHORIZATION', 'WAITING_RATE_LIMIT'}
-            or (job['resume_after'] is not None and job['resume_after'] > timestamp)
+            or effective_wait_until is not None
         )
         if started_at and processed and not uncertain_wait:
             rate = processed / max(timestamp - started_at, 0.001)
@@ -566,6 +591,8 @@ class QueueStore:
             "requeue_block_reason": self._requeue_block_reason(job['state'], active_claims),
             "confirmed": confirmed, "counts": by_status, "phase_remaining": phase_remaining,
             "result_summary": summary,
+            "account_wait_until": account_wait_until, "effective_wait_until": effective_wait_until,
+            "cleanup_waits": cleanup_waits,
             "phase_total": phase_total, "phase_processed": phase_total - phase_remaining,
             "items_per_minute": round(processed / max(timestamp - started_at, 0.001) * 60, 1) if started_at and processed else None,
             "eta_seconds": eta_seconds,

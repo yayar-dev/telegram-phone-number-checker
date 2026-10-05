@@ -83,7 +83,7 @@ class DurableValidatorApplication:
             "raw": job["raw_input"],
             "complete": state in {"COMPLETED", "CANCELLED", "FAILED"},
             "started": state in {"QUEUED", "RUNNING", "WAITING_RATE_LIMIT"},
-            "waiting_until": job["resume_after"],
+            "waiting_until": job["effective_wait_until"],
             "error": job["last_error"],
             "rows": self.store.rows(job_id),
             "deferred_phones": [],
@@ -261,6 +261,9 @@ def _render_page(
         processed = job["processed"]
         total = job["total"]
         message = html.escape(job.get("message", ""))
+        if job.get('account_wait_until') or job.get('cleanup_waits'):
+            if job.get('message') == 'Задача ожидает worker.':
+                message = ''
         controls = ""
         if state == "STAGED":
             controls = (
@@ -300,12 +303,24 @@ def _render_page(
                         + _action_form(job['id'], 'requeue-unknown-outcomes', 'Разрешить повтор проверок с неизвестным результатом', secondary=True)
                     )
         waiting = ""
+        if job.get('account_wait_until'):
+            waiting += '<p>Telegram ограничил запросы для всего аккаунта; ожидание сохранено.</p>'
         if job.get("waiting_until"):
             remaining = max(0, round(job["waiting_until"] - time.time()))
-            waiting = (
+            waiting += (
                 f"<p>Ожидание Telegram: следующая попытка через {remaining // 60} мин. "
                 f"{remaining % 60} сек.</p>"
             )
+        for cleanup in job.get('cleanup_waits', []):
+            reason = html.escape(cleanup['reason'])
+            waiting += f'<p>Очистка контактов ({cleanup["count"]}): {reason}</p>'
+            if cleanup['next_attempt_at'] is None:
+                waiting += '<p>Автоматический повтор очистки не назначен.</p>'
+            else:
+                deadline = cleanup['next_attempt_at']
+                remaining = max(0, round(deadline - time.time()))
+                waiting += (f'<p data-next-attempt-at="{deadline:g}">Следующая попытка очистки через {remaining // 60} мин. '
+                            f'{remaining % 60} сек.; запуск зависит от состояния задачи и лимита Telegram.</p>')
         retry_times = [row['next_attempt_at'] for row in job['rows']
                        if row['status'] in {'PENDING_RETRY', 'RETRYABLE_ERROR'} and row.get('next_attempt_at') is not None]
         if retry_times:

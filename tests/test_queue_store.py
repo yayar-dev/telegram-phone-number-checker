@@ -67,6 +67,32 @@ def test_result_summary_suppresses_eta_for_unresolved_waits(tmp_path, obstacle):
     assert store.snapshot(job_id)['eta_seconds'] is None
 
 
+def test_account_floodwait_suppresses_other_jobs_eta_and_exposes_effective_wait(tmp_path):
+    clock = Clock()
+    store = QueueStore(tmp_path / 'validator.db', now=clock)
+    other_job = store.create_job('+79990000000\n+79991111111')
+    store.start(other_job)
+    store.finish_claim(store.claim_next('worker'), {'error': 'No response'})
+    store.pause(other_job)
+    flood_job = store.create_job('+79992222222')
+    store.start(flood_job)
+    clock.value = 1010
+    store.defer_account_floodwait([store.claim_next('worker')], 300)
+    store.start(other_job)
+    snapshot = store.snapshot(other_job)
+    assert snapshot['state'] == 'QUEUED'
+    assert snapshot['resume_after'] is None
+    assert snapshot['eta_seconds'] is None
+    assert snapshot['account_wait_until'] == 1310
+    assert snapshot['effective_wait_until'] == 1310
+    assert store.claim_next('worker') is None
+    clock.value = 1311
+    snapshot = store.snapshot(other_job)
+    assert snapshot['account_wait_until'] is None
+    assert snapshot['effective_wait_until'] is None
+    assert snapshot['eta_seconds'] == 311
+
+
 def test_store_creates_every_input_ordinal_and_restores_it(tmp_path):
     database = tmp_path / "validator.db"
     store = QueueStore(database)

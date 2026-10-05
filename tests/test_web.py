@@ -1396,3 +1396,61 @@ def test_authorization_wait_page_requires_explicit_resume_after_browser_login(re
     assert app.start(job_id) is True
     assert app.start(job_id) is False
     assert sum(event['kind'] == 'STARTED' for event in app.store.events(job_id)) == 2
+
+
+@pytest.mark.parametrize('outcome, reason, deadline', [
+    ('retry', 'Ошибка запроса очистки Telegram; повтор запланирован.', 1120),
+    ('floodwait', 'Telegram ограничил очистку контактов.', 1300),
+    ('unknown', 'Результат очистки неизвестен; требуется решение оператора.', None),
+])
+def test_cleanup_wait_page_exposes_real_cleanup_reason_and_deadline(review_web_app, monkeypatch, outcome, reason, deadline):
+    app, _ = review_web_app
+    app.store.now = lambda: 1000
+    monkeypatch.setattr(time, 'time', lambda: 1000)
+    job_id = app.enqueue('+79993333333\n+79994444444')
+    app.store.start(job_id)
+    app.store.finish_claim(app.store.claim_next('worker'), {'id': 123})
+    claim = app.store.claim_cleanup('worker')
+    assert claim is not None
+    if outcome == 'retry':
+        app.store.retry_cleanup(claim, RuntimeError('OTP=secret password=secret'))
+    elif outcome == 'floodwait':
+        app.store.defer_cleanup_floodwait(claim, 300)
+    else:
+        app.store.defer_cleanup_unknown_outcome(claim)
+    snapshot = app.store.snapshot(job_id)
+    assert snapshot['cleanup_waits'] == [{
+        'state': 'UNKNOWN_OUTCOME_REVIEW' if outcome == 'unknown' else 'PENDING',
+        'reason': reason, 'next_attempt_at': deadline, 'count': 1,
+    }]
+    page = app.render_job_page(job_id)
+    assert reason in page
+    assert 'Оценка до завершения' not in page
+    assert 'ожидает worker' not in page
+    assert 'secret' not in page
+    if deadline is not None:
+        assert 'Следующая попытка очистки через' in page
+        assert f'data-next-attempt-at="{deadline}"' in page
+    else:
+        assert 'Автоматический повтор очистки не назначен.' in page
+
+
+def test_other_job_page_shows_account_floodwait_and_hides_eta(review_web_app, monkeypatch):
+    app, _ = review_web_app
+    clock = [1000]
+    app.store.now = lambda: clock[0]
+    monkeypatch.setattr(time, 'time', lambda: clock[0])
+    other_job = app.enqueue('+79993333333\n+79994444444')
+    app.store.start(other_job)
+    app.store.finish_claim(app.store.claim_next('worker'), {'error': 'No response'})
+    app.store.pause(other_job)
+    flood_job = app.enqueue('+79995555555')
+    app.store.start(flood_job)
+    clock[0] = 1010
+    app.store.defer_account_floodwait([app.store.claim_next('worker')], 300)
+    app.store.start(other_job)
+    page = app.render_job_page(other_job)
+    assert 'Telegram ограничил запросы для всего аккаунта; ожидание сохранено.' in page
+    assert 'следующая попытка через 5 мин. 0 сек.' in page
+    assert 'Оценка до завершения' not in page
+    assert 'ожидает worker' not in page
