@@ -22,7 +22,7 @@
 ## Review Focus
 
 - Missing/revoked user session pauses affected jobs and performs no terminal prompt or repeated API request.
-- A transport failure after dispatch produces an unknown-outcome retry, never an automatic replay of `ImportContactsRequest` or cleanup.
+- A transport failure after dispatch produces a non-claimable unknown-outcome review state, never an automatic replay of `ImportContactsRequest` or cleanup.
 - Legacy direct-lookup rows, including pending rows, cannot run the obsolete fallback after migration.
 - Cleanup work cannot starve imports or double Telegram RPC volume under normal throughput.
 - Stop/start during an in-flight request keeps a recoverable lease and does not leak OTP/2FA secrets.
@@ -34,7 +34,7 @@
 - Create `telegram_phone_number_checker/user_session.py`: single session owner, browser authorization, serialized API execution, handoff, reconnect and shutdown.
 - Modify `telegram_phone_number_checker/durable_web.py`: use the session owner, render authorization/result state, migration action, and deterministic shutdown.
 - Modify `telegram_phone_number_checker/validator_worker.py`: classify request outcomes, defer import retries, and schedule cleanup after imports.
-- Modify `telegram_phone_number_checker/queue_store.py`: attempt history, `PENDING_RETRY`, adaptive import state, paused-job migration, summary counts, and authorization pause.
+- Modify `telegram_phone_number_checker/queue_store.py`: attempt history, `PENDING_RETRY`, non-claimable unknown-outcome review, adaptive import state, paused-job migration, summary counts, and authorization pause.
 - Modify `telegram_phone_number_checker/web.py`: wire application shutdown and SIGTERM-safe stop handling.
 - Create `tests/test_user_session.py`; modify `tests/test_validator_worker.py`, `tests/test_queue_store.py`, `tests/test_web.py`, and `README.md`.
 
@@ -116,8 +116,8 @@ git commit -m "feat: own Telegram user session persistently"
 - Modify: `tests/test_validator_worker.py`
 
 **Interfaces:**
-- Produces: `QueueStore.defer_import_retries(claims: list[dict], reason: str) -> None`, `defer_unknown_outcome(claims: list[dict], method: str) -> None`, `pause_for_authorization(claims: list[dict]) -> None`, `record_import_batch_success(job_id: str) -> None`, and `claim_cleanup_batch(owner: str, limit: int) -> dict | None`.
-- Produces: nonterminal row status `PENDING_RETRY`; ready SQL accepts it only when its persisted `next_attempt_at` is due.
+- Produces: `QueueStore.record_item_attempt(...) -> None`, `defer_import_retries(claims: list[dict], reason: str) -> None`, `defer_unknown_outcome(claims: list[dict], method: str) -> None`, `pause_for_authorization(claims: list[dict]) -> None`, `record_import_batch_success(job_id: str) -> None`, and `claim_cleanup_batch(owner: str, limit: int) -> dict | None`.
+- Produces: claimable nonterminal row status `PENDING_RETRY` and non-claimable `UNKNOWN_OUTCOME_REVIEW`; ready SQL accepts only `PENDING_RETRY` when its persisted `next_attempt_at` is due.
 
 - [ ] **Step 1: Write failing worker/store tests**
 
@@ -132,8 +132,9 @@ def test_retry_contacts_return_to_import_queue_without_resolve_phone():
 def test_unknown_outcome_after_dispatched_import_is_not_replayed():
     worker.run_once()
     assert gateway.import_calls == 1
-    assert store.rows(job_id)[0]["status"] == "PENDING_RETRY"
+    assert store.rows(job_id)[0]["status"] == "UNKNOWN_OUTCOME_REVIEW"
     assert store.events(job_id)[-1]["kind"] == "UNKNOWN_OUTCOME"
+    assert worker.run_once() is False
 
 
 def test_revoked_session_pauses_job_without_incrementing_normal_retry_count():
@@ -141,7 +142,7 @@ def test_revoked_session_pauses_job_without_incrementing_normal_retry_count():
     assert store.snapshot(job_id)["state"] == "WAITING_AUTHORIZATION"
 ```
 
-Add tests for a 230-second `FloodWait`, five successful batches restoring 1 → 5 then 5 → 10, cancellation of `PENDING_RETRY`, and five ready import batches running before one cleanup batch.
+Add tests for a 230-second `FloodWait`, five successful batches restoring 1 → 5 then 5 → 10, cancellation of `PENDING_RETRY`, five ready import batches running before one cleanup batch, and a paused job with pending cleanup issuing no Telegram request.
 
 - [ ] **Step 2: Run those tests to verify they fail**
 
@@ -151,11 +152,11 @@ Expected: FAIL because retry contacts currently enter `DIRECT_LOOKUP` and cleanu
 
 - [ ] **Step 3: Implement safe outcome routing**
 
-Add `PENDING_RETRY` to claim, duplicate, pause, cancel, and recovery predicates. For `retry_contacts`, keep `method='IMPORT'`, set retry delays to 60 seconds, then 300 seconds, then 900 seconds for all later retries, and append an `IMPORT_RETRY` attempt record. On `RequestOutcomeUnknownError`, set `PENDING_RETRY` with a 300-second delay and an `UNKNOWN_OUTCOME` record; do not resend automatically. On `RequestNotDispatchedError`, use the ordinary recoverable path. On `UserSessionUnavailableError`, release claims and set the job `WAITING_AUTHORIZATION` without increasing ordinary failure counters.
+Create `job_item_attempts` before routing any request outcome, with item id, timestamp, method, outcome, detail, and source; append immutable records for terminal API results, retries, FloodWait, unknown outcomes, and migrations. Add `PENDING_RETRY` to claim, duplicate, pause, cancel, and recovery predicates. For `retry_contacts`, keep `method='IMPORT'`, set retry delays to 60 seconds, then 300 seconds, then 900 seconds for all later retries, and append an `IMPORT_RETRY` attempt record. On `RequestOutcomeUnknownError`, set non-claimable `UNKNOWN_OUTCOME_REVIEW`, append an `UNKNOWN_OUTCOME` record, and require an explicit operator requeue action before any new import. On `RequestNotDispatchedError`, use the ordinary recoverable path. On `UserSessionUnavailableError`, release claims and set the job `WAITING_AUTHORIZATION` without increasing ordinary failure counters.
 
 Add `import_success_streak` to `jobs`; reset it on retry, unknown outcome, or FloodWait. Five retry-free import batches restore batch size from 1 → 5 or 5 → 10. Persist all server `FloodWait` values exactly and reset the streak.
 
-Replace cleanup-first behavior with an import budget of five completed import batches before one `claim_cleanup_batch` call; cleanup remains durable, serial, and subject to the same FloodWait handling.
+Replace cleanup-first behavior with an import budget of five completed import batches before one `claim_cleanup_batch` call; `claim_cleanup_batch` must join `jobs` and select only `QUEUED` or `RUNNING` jobs. Cleanup remains durable, serial, and subject to the same FloodWait handling.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -168,7 +169,7 @@ git add telegram_phone_number_checker/queue_store.py telegram_phone_number_check
 git commit -m "fix: preserve safe import retries"
 ```
 
-### Task 3: Immutable attempt history and paused-job migration
+### Task 3: Paused-job migration and explicit unknown-outcome review
 
 **Files:**
 - Modify: `telegram_phone_number_checker/queue_store.py:50-120,291-348,849-924`
@@ -177,8 +178,9 @@ git commit -m "fix: preserve safe import retries"
 - Modify: `tests/test_web.py`
 
 **Interfaces:**
-- Produces: `QueueStore.record_item_attempt(...) -> None`, `item_attempts(job_id: str, item_id: str) -> list[dict]`, and `requeue_legacy_direct_rows(job_id: str) -> int`.
-- Produces: `POST /jobs/<job_id>/requeue-legacy-direct`, accepted only for a paused job with no active claims.
+- Consumes: the `job_item_attempts` schema and `record_item_attempt` created in Task 2.
+- Produces: `item_attempts(job_id: str, item_id: str) -> list[dict]`, `requeue_legacy_direct_rows(job_id: str) -> int`, and `requeue_unknown_outcomes(job_id: str) -> int`.
+- Produces: `POST /jobs/<job_id>/requeue-legacy-direct` and `POST /jobs/<job_id>/requeue-unknown-outcomes`, accepted only for a paused job with no active claims.
 
 - [ ] **Step 1: Write failing migration/audit tests**
 
@@ -195,7 +197,7 @@ def test_migration_keeps_manual_confirmation_and_api_matches_unchanged():
     assert store.requeue_legacy_direct_rows(job_id) == 0
 ```
 
-Add a page test for migration action visibility only when paused/no claims and an HTTP test proving a running or in-progress job moves no row.
+Add page tests for both migration actions only when paused/no claims, including an unknown-outcome review row; add HTTP tests proving a running or in-progress job moves no row.
 
 - [ ] **Step 2: Run migration tests to verify they fail**
 
@@ -205,9 +207,9 @@ Expected: FAIL because immutable item history and migration do not exist.
 
 - [ ] **Step 3: Implement audit-safe migration**
 
-Create `job_item_attempts` with item id, timestamp, method, outcome, detail, and source; append it for every terminal API result, retry, FloodWait, unknown outcome, and migration. Retain `api_status` as the current last API outcome, but do not treat it as history.
+Use the immutable attempt history created in Task 2. Retain `api_status` as the current last API outcome, but do not treat it as history.
 
-For an eligible paused job with zero active claims, migrate every legacy `DIRECT_LOOKUP` row in `PENDING`, `RETRYABLE_ERROR`, or `UNRESOLVABLE_OR_PRIVACY` to `PENDING_RETRY` + `IMPORT` + `next_attempt_at=now+60`. Exclude rows with `MANUAL_CHAT_CONFIRMED` and API-confirmed rows. Append a row-level migration attempt and job-level summary event. Do not auto-resume.
+For an eligible paused job with zero active claims, migrate every legacy `DIRECT_LOOKUP` row in `PENDING`, `RETRYABLE_ERROR`, or `UNRESOLVABLE_OR_PRIVACY` to `PENDING_RETRY` + `IMPORT` + `next_attempt_at=now+60`. Exclude rows with `MANUAL_CHAT_CONFIRMED` and API-confirmed rows. Append a row-level migration attempt and job-level summary event. Separately, move `UNKNOWN_OUTCOME_REVIEW` rows to `PENDING_RETRY` only through `requeue_unknown_outcomes`; preserve their unknown-outcome attempt history. Do not auto-resume.
 
 - [ ] **Step 4: Render and verify the operator action**
 
@@ -232,7 +234,7 @@ git commit -m "feat: migrate legacy direct validation safely"
 - Modify: `tests/test_web.py`
 
 **Interfaces:**
-- Produces: `QueueStore.result_summary(job_id: str) -> dict[str, int]` with `api_confirmed`, `pending_retry`, `privacy_ambiguous`, `pending_import`, `waiting_authorization`, and `unknown_outcome`.
+- Produces: `QueueStore.result_summary(job_id: str) -> dict[str, int]` with `api_confirmed`, `pending_retry`, `privacy_ambiguous`, `pending_import`, `waiting_authorization`, and `unknown_outcome_review`.
 
 - [ ] **Step 1: Write failing summary/UI tests**
 
@@ -244,7 +246,7 @@ def test_result_summary_separates_api_confirmation_from_privacy_and_retry():
         "privacy_ambiguous": 4,
         "pending_import": 5,
         "waiting_authorization": 0,
-        "unknown_outcome": 1,
+        "unknown_outcome_review": 1,
     }
 ```
 
@@ -258,7 +260,7 @@ Expected: FAIL because `result_summary` is missing.
 
 - [ ] **Step 3: Implement summary, copy, and documentation**
 
-Count `FOUND` and `FOUND_NO_USERNAME` as API-confirmed, `PENDING_RETRY` separately, `UNRESOLVABLE_OR_PRIVACY` separately, and pending `IMPORT` rows separately. Suppress a confident completion ETA whenever retry, unknown-outcome, FloodWait, or authorization wait exists; show the stored reason and next attempt instead. Document browser authorization, paused-job migration, manual confirmation, privacy ambiguity, and Docker stop/start.
+Count `FOUND` and `FOUND_NO_USERNAME` as API-confirmed, `PENDING_RETRY` separately, `UNRESOLVABLE_OR_PRIVACY` separately, `UNKNOWN_OUTCOME_REVIEW` separately, and pending `IMPORT` rows separately. Suppress a confident completion ETA whenever retry, unknown-outcome review, FloodWait, or authorization wait exists; show the stored reason and next attempt instead. Document browser authorization, paused-job migration, manual confirmation, privacy ambiguity, unknown-outcome operator requeue, and Docker stop/start.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -291,7 +293,7 @@ def test_paused_legacy_job_migrates_authorizes_and_resumes_without_new_client():
     assert fake_factory.created == 1
 ```
 
-Add a restart test that stops the application while one import lease is active, opens the same database in a new application, and proves no item is lost or double-finished.
+Add a restart test that stops the application while one import lease is active, opens the same database in a new application, and proves no item is lost or double-finished. Add a secrecy test that submits distinctive OTP and 2FA values, then asserts they appear in none of the SQLite tables/events, CSV output, application logs, or rendered HTML.
 
 - [ ] **Step 2: Run lifecycle tests to verify they fail**
 
@@ -321,7 +323,7 @@ git commit -m "test: cover persistent user-session lifecycle"
 
 ## Self-Review
 
-- Spec coverage: Task 1 owns the one user session and secure handoff; Task 2 owns rate-aware scheduling and unknown outcomes; Task 3 owns per-item history and migration; Task 4 owns truthful operator output; Task 5 proves restart behavior.
-- CTO blockers: pending legacy direct rows, unknown request outcomes, revoked sessions, durable attempt history, authorization handoff, deterministic shutdown, cleanup starvation, visible retry policy, and full acceptance coverage each have an explicit task and test.
+- Spec coverage: Task 1 owns the one user session and secure handoff; Task 2 owns attempt history, rate-aware scheduling, and unknown outcomes; Task 3 owns migration and explicit unknown-outcome review; Task 4 owns truthful operator output; Task 5 proves restart behavior.
+- CTO blockers: pending legacy direct rows, unknown request outcomes, revoked sessions, durable attempt history, authorization handoff, deterministic shutdown, cleanup starvation, visible retry policy, secrecy, and full acceptance coverage each have an explicit task and test.
 - Type consistency: the worker continues to consume the existing synchronous gateway protocol while the session owner encapsulates its asyncio loop.
 - Scope: no multi-account dispatch, bot workflow, or client UI automation is included.
