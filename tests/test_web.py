@@ -221,6 +221,30 @@ def test_durable_home_shows_two_factor_password_form_when_required(tmp_path):
     assert 'action="/auth/password"' in page
 
 
+def test_durable_home_refreshes_while_telegram_verifies_otp(tmp_path):
+    class _VerifyingCodeAuthorization:
+        def snapshot(self):
+            return {"state": "VERIFYING_CODE", "message": "Проверяем код Telegram…"}
+
+        def begin(self, phone_number=None):
+            return False
+
+        def submit_code(self, code):
+            return False
+
+        def submit_password(self, password):
+            return False
+
+    app = DurableValidatorApplication(
+        tmp_path / "validator.db", authorization=_VerifyingCodeAuthorization()
+    )
+
+    page = app.render_home_page()
+
+    assert "Проверяем код Telegram…" in page
+    assert '<meta http-equiv="refresh" content="2">' in page
+
+
 def test_durable_web_submits_telegram_code_from_browser(tmp_path):
     authorization = _CodeSentAuthorization()
     app = DurableValidatorApplication(tmp_path / "validator.db", authorization=authorization)

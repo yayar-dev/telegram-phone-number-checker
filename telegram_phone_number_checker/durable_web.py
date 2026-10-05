@@ -62,6 +62,7 @@ class TelegramAuthorization:
             if self._state != "PASSWORD_REQUIRED":
                 return False
             self._password = password
+            self._state = "VERIFYING_PASSWORD"
             self._message = "Проверяем пароль 2FA…"
             self._password_ready.set()
         return True
@@ -74,6 +75,7 @@ class TelegramAuthorization:
             if self._state != "CODE_SENT":
                 return False
             self._code = clean_code
+            self._state = "VERIFYING_CODE"
             self._message = "Проверяем код Telegram…"
             self._code_ready.set()
         return True
@@ -460,7 +462,7 @@ def _render_authorization(authorization: dict[str, str]) -> str:
             '<input id="telegram-password" name="password" type="password" autocomplete="current-password" required>'
             '<p><button type="submit">Подтвердить пароль</button></p></form>'
         )
-    if state == "REQUESTING_CODE":
+    if state in {"REQUESTING_CODE", "VERIFYING_CODE", "VERIFYING_PASSWORD"}:
         return f'<p class="hint">{message}</p><meta http-equiv="refresh" content="2">'
     return (
         f'<p class="hint">{message}</p><form method="post" action="/auth/begin">'
