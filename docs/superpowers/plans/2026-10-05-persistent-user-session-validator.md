@@ -102,7 +102,7 @@ On a connect failure before any request dispatch, invalidate and dispose the bro
 
 - [ ] **Step 4: Wire service lifecycle into the application**
 
-Replace `TelegramAuthorization` plus short-lived `TelethonGateway` with a shared `UserSessionService`; retain the existing browser endpoints and dependency injection for tests. Add `DurableValidatorApplication.close()`. In `web.main()`, install a SIGTERM handler that stops `serve_forever()`, then calls application close after the server stops accepting requests. A successful browser authorization leaves jobs in `WAITING_AUTHORIZATION`; it never submits work itself. The later explicit resume path is enabled only for an `AUTHORIZED` service snapshot.
+Replace `TelegramAuthorization` plus short-lived `TelethonGateway` with a shared `UserSessionService`; retain the existing browser endpoints and dependency injection for tests. Add `DurableValidatorApplication.close()`. In `web.main()`, install a SIGTERM handler that starts a short helper thread to call `server.shutdown()`; never invoke `shutdown()` on the `serve_forever()` thread. Use `finally` after `serve_forever()` returns to call application close after the server stops accepting requests. A successful browser authorization leaves jobs in `WAITING_AUTHORIZATION`; it never submits work itself. The later explicit resume path is enabled only for an `AUTHORIZED` service snapshot.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -302,7 +302,7 @@ def test_paused_legacy_job_migrates_authorizes_and_resumes_without_new_client():
     assert fake_factory.created == 1
 ```
 
-Add a restart test that stops the application while one import lease is active, opens the same database in a new application, and proves no item is lost or double-finished. Add a secrecy test that submits distinctive OTP and 2FA values, then asserts they appear in none of the SQLite tables/events, CSV output, application logs, or rendered HTML.
+Add a restart test that stops the application while one import lease is active, opens the same database in a new application, and proves no item is lost or double-finished. Add an integration test that sends SIGTERM during an active request and proves the process exits within Docker's configured grace period, without hanging `serve_forever()` or leaking its active lease. Add a secrecy test that submits distinctive OTP and 2FA values, then asserts they appear in none of the SQLite tables/events, CSV output, application logs, or rendered HTML.
 
 - [ ] **Step 2: Run lifecycle tests to verify they fail**
 
@@ -333,6 +333,6 @@ git commit -m "test: cover persistent user-session lifecycle"
 ## Self-Review
 
 - Spec coverage: Task 1 owns the one user session and secure handoff; Task 2 owns attempt history, rate-aware scheduling, and unknown outcomes; Task 3 owns migration and explicit unknown-outcome review; Task 4 owns truthful operator output; Task 5 proves restart behavior.
-- CTO blockers: pending legacy direct rows, unknown request outcomes, revoked sessions and their explicit resume transition, pre-dispatch client recovery, durable attempt history, authorization handoff, deterministic shutdown, cleanup starvation, visible retry policy, secrecy, and full acceptance coverage each have an explicit task and test.
+- CTO blockers: pending legacy direct rows, unknown request outcomes, revoked sessions and their explicit resume transition, pre-dispatch client recovery, durable attempt history, authorization handoff, helper-thread SIGTERM shutdown, cleanup starvation, visible retry policy, secrecy, and full acceptance coverage each have an explicit task and test.
 - Type consistency: the worker continues to consume the existing synchronous gateway protocol while the session owner encapsulates its asyncio loop.
 - Scope: no multi-account dispatch, bot workflow, or client UI automation is included.
